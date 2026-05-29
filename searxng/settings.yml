@@ -22,8 +22,8 @@ search:
     - json
 
 outgoing:
-  request_timeout: 15.0
-  max_request_timeout: 30.0
+  request_timeout: 6.0
+  max_request_timeout: 10.0
   pool_connections: 100
   pool_maxsize: 20
   enable_http2: true
@@ -60,12 +60,12 @@ engines:
   - name: startpage
     engine: startpage
     categories: general
-    disabled: false
+    disabled: true
 
   - name: mojeek
     engine: mojeek
     categories: general
-    disabled: false
+    disabled: true
 
   # --- Knowledge ---
   - name: wikipedia

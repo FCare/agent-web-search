@@ -421,11 +421,16 @@ async def on_user_connected(topic: str, payload):
 
         loop = asyncio.get_event_loop()
 
-        # 1. Classify + search raw query in parallel
-        classification, raw_results = await asyncio.gather(
-            loop.run_in_executor(None, _classify_query_sync, query, recent),
-            _search(query, categories, n_results),
-        )
+        # 1. Classify + search in parallel (skip classify if no context)
+        if recent:
+            classification, raw_results = await asyncio.gather(
+                loop.run_in_executor(None, _classify_query_sync, query, recent),
+                _search(query, categories, n_results),
+            )
+        else:
+            classification = {"is_followup": False, "topic_index": -1, "refined_query": query, "topic": query[:60]}
+            raw_results = await _search(query, categories, n_results)
+
         is_followup = classification.get("is_followup", False)
         topic_index = classification.get("topic_index", -1)
         refined_query = classification.get("refined_query", query)
