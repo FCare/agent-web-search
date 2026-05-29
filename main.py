@@ -316,6 +316,16 @@ def _dedup_results(results: list[dict]) -> list[dict]:
     return out
 
 
+async def _enrich_entry_background(entry: SearchEntry, results: list[dict], username: str):
+    """Fetch full page content in background and update the context entry silently."""
+    try:
+        enriched = await _enrich_results(results)
+        entry.results = enriched
+        logger.info(f"[{username}] Enrichissement background terminé pour '{entry.topic}' ({len(enriched)} résultats)")
+    except Exception as e:
+        logger.warning(f"[{username}] Enrichissement background échoué: {e}")
+
+
 # ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------
@@ -411,18 +421,23 @@ async def on_user_connected(topic: str, payload):
 
         loop = asyncio.get_event_loop()
 
-        # 1. Classify: follow-up or new topic?
-        classification = await loop.run_in_executor(None, _classify_query_sync, query, recent)
+        # 1. Classify + search raw query in parallel
+        classification, raw_results = await asyncio.gather(
+            loop.run_in_executor(None, _classify_query_sync, query, recent),
+            _search(query, categories, n_results),
+        )
         is_followup = classification.get("is_followup", False)
         topic_index = classification.get("topic_index", -1)
         refined_query = classification.get("refined_query", query)
         topic = classification.get("topic", query[:60])
 
-        # 2. Search SearXNG with refined query + fetch full page content
-        new_results = await _search(refined_query, categories, n_results)
-        new_results = await _enrich_results(new_results)
+        # If follow-up with a different refined query, search again with the refined query
+        if is_followup and refined_query != query:
+            new_results = await _search(refined_query, categories, n_results)
+        else:
+            new_results = raw_results
 
-        # 3. If follow-up: merge with context results for richer synthesis
+        # 2. Merge with context if follow-up
         context_report = None
         all_results = new_results
         if is_followup and 0 <= topic_index < len(recent):
@@ -440,16 +455,12 @@ async def on_user_connected(topic: str, payload):
             })
             return
 
-        # 4. Synthesize
+        # 3. Synthesize immediately from snippets → fast first response
         report = await loop.run_in_executor(None, _synthesize_sync, query, all_results, detail_level, context_report)
 
-        # 5. Store in context
-        ctx.add(SearchEntry(
-            query=query,
-            topic=topic,
-            results=all_results,
-            report=report,
-        ))
+        # 4. Store entry with snippet-only results, publish response immediately
+        entry = SearchEntry(query=query, topic=topic, results=all_results, report=report)
+        ctx.add(entry)
 
         sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in all_results[:5]]
         await nexus.publish(result_topic, {
@@ -459,6 +470,9 @@ async def on_user_connected(topic: str, payload):
             "sources": sources,
         })
         logger.info(f"[{username}] Résultat publié sur {result_topic}")
+
+        # 5. Background: fetch full page content and enrich context for future follow-ups
+        asyncio.create_task(_enrich_entry_background(entry, new_results, username))
 
     nexus.subscribe(request_topic, on_search_request)
     nexus.start_listening()
