@@ -112,6 +112,17 @@ engines:
     categories: science
     disabled: false
 
+  # --- Site-specific ---
+  - name: korben.info
+    engine: xpath
+    url: https://www.bing.com/search?q=site%3Akorben.info+{query}&setlang=fr
+    url_xpath: //li[contains(@class,"b_algo")]//h2/a/@href
+    title_xpath: //li[contains(@class,"b_algo")]//h2/a//text()
+    content_xpath: //li[contains(@class,"b_algo")]//.[@class="b_caption"]//p//text()
+    categories: it, news
+    disabled: false
+    timeout: 10.0
+
   # --- IT ---
   - name: github
     engine: github
