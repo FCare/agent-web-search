@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import openai
+import trafilatura
 from nexus_client import NexusClient
 
 logging.basicConfig(
@@ -29,6 +30,9 @@ SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080")
 DEFAULT_N_RESULTS = int(os.environ.get("DEFAULT_N_RESULTS", "8"))
 CONTEXT_TTL_SECONDS = int(os.environ.get("CONTEXT_TTL_SECONDS", str(2 * 3600)))
 CONTEXT_MAX_ENTRIES = int(os.environ.get("CONTEXT_MAX_ENTRIES", "10"))
+FETCH_TOP_N = int(os.environ.get("FETCH_TOP_N", "4"))
+FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "8"))
+FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "3000"))
 
 AGENT_NAME = "search"
 _subscribed_users: set[str] = set()
@@ -245,6 +249,62 @@ async def _search(query: str, categories: str, n: int) -> list[dict]:
         return []
 
 
+_FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; SearXNG/1.0; +https://searxng.org)",
+    "Accept": "text/html,application/xhtml+xml",
+    "Accept-Language": "fr,en;q=0.9",
+}
+
+
+async def _fetch_page_content(session: aiohttp.ClientSession, url: str) -> str | None:
+    try:
+        async with session.get(
+            url,
+            headers=_FETCH_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=FETCH_TIMEOUT),
+            allow_redirects=True,
+        ) as resp:
+            if resp.status != 200:
+                return None
+            ct = resp.headers.get("Content-Type", "")
+            if "text/html" not in ct:
+                return None
+            html = await resp.text(errors="replace")
+            text = trafilatura.extract(
+                html,
+                include_comments=False,
+                include_tables=True,
+                no_fallback=False,
+            )
+            if text:
+                return text[:FETCH_MAX_CHARS]
+            return None
+    except Exception:
+        return None
+
+
+async def _enrich_results(results: list[dict]) -> list[dict]:
+    """Fetch full page content for top N results, fallback to SearXNG snippet."""
+    to_fetch = [r for r in results[:FETCH_TOP_N] if r.get("url")]
+    async with aiohttp.ClientSession() as session:
+        fetched = await asyncio.gather(*[_fetch_page_content(session, r["url"]) for r in to_fetch])
+
+    enriched = []
+    fetch_idx = 0
+    for i, result in enumerate(results):
+        r = dict(result)
+        if i < FETCH_TOP_N:
+            full = fetched[fetch_idx]
+            fetch_idx += 1
+            if full:
+                r["content"] = full
+                logger.info(f"Fetch OK: {r['url'][:60]} ({len(full)} chars)")
+            else:
+                logger.debug(f"Fetch échoué, fallback snippet: {r.get('url', '')[:60]}")
+        enriched.append(r)
+    return enriched
+
+
 def _dedup_results(results: list[dict]) -> list[dict]:
     seen = set()
     out = []
@@ -358,8 +418,9 @@ async def on_user_connected(topic: str, payload):
         refined_query = classification.get("refined_query", query)
         topic = classification.get("topic", query[:60])
 
-        # 2. Search SearXNG with refined query
+        # 2. Search SearXNG with refined query + fetch full page content
         new_results = await _search(refined_query, categories, n_results)
+        new_results = await _enrich_results(new_results)
 
         # 3. If follow-up: merge with context results for richer synthesis
         context_report = None
