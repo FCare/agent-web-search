@@ -79,11 +79,6 @@ engines:
     categories: general
     disabled: false
 
-  - name: wolframalpha api
-    engine: wolframalpha api
-    categories: science, general
-    disabled: false
-
   # --- News ---
   - name: google news
     engine: google_news
@@ -117,17 +112,7 @@ engines:
     categories: science
     disabled: false
 
-  - name: openaire
-    engine: openaire
-    categories: science
-    disabled: false
-
   # --- IT ---
-  - name: stackoverflow
-    engine: stackoverflow
-    categories: it
-    disabled: false
-
   - name: github
     engine: github
     categories: it
@@ -166,11 +151,6 @@ engines:
     disabled: false
 
   # --- Music ---
-  - name: musicbrainz
-    engine: musicbrainz
-    categories: music
-    disabled: false
-
   - name: genius
     engine: genius
     categories: music
@@ -187,12 +167,6 @@ engines:
     categories: videos
     disabled: false
 
-  # --- Files ---
-  - name: archive.org
-    engine: internet_archive
-    categories: files, general
-    disabled: false
-
   # --- Images ---
   - name: google images
     engine: google_images
@@ -204,7 +178,3 @@ engines:
     categories: images
     disabled: false
 
-  - name: flickr
-    engine: flickr
-    categories: images
-    disabled: false
