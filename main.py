@@ -3,8 +3,6 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import openai
@@ -28,8 +26,6 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080")
 DEFAULT_N_RESULTS = int(os.environ.get("DEFAULT_N_RESULTS", "4"))
-CONTEXT_TTL_SECONDS = int(os.environ.get("CONTEXT_TTL_SECONDS", str(2 * 3600)))
-CONTEXT_MAX_ENTRIES = int(os.environ.get("CONTEXT_MAX_ENTRIES", "10"))
 FETCH_TOP_N = int(os.environ.get("FETCH_TOP_N", "4"))
 FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "8"))
 FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "3000"))
@@ -38,76 +34,8 @@ AGENT_NAME = "search"
 _subscribed_users: set[str] = set()
 
 # ---------------------------------------------------------------------------
-# User search context
-# ---------------------------------------------------------------------------
-
-@dataclass
-class SearchEntry:
-    query: str
-    topic: str
-    results: list[dict]
-    report: str
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-class UserSearchContext:
-    def __init__(self):
-        self._entries: list[SearchEntry] = []
-
-    def recent(self) -> list[SearchEntry]:
-        cutoff = datetime.now(timezone.utc) - timedelta(seconds=CONTEXT_TTL_SECONDS)
-        self._entries = [e for e in self._entries if e.timestamp > cutoff]
-        return self._entries[-CONTEXT_MAX_ENTRIES:]
-
-    def add(self, entry: SearchEntry):
-        self._entries.append(entry)
-
-
-_user_contexts: dict[str, UserSearchContext] = {}
-
-
-def _get_context(username: str) -> UserSearchContext:
-    if username not in _user_contexts:
-        _user_contexts[username] = UserSearchContext()
-    return _user_contexts[username]
-
-
-# ---------------------------------------------------------------------------
 # LLM tools
 # ---------------------------------------------------------------------------
-
-CLASSIFY_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "classify_query",
-        "description": "Classify the query: is it a follow-up/deepening of a recent topic?",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "is_followup": {
-                    "type": "boolean",
-                    "description": "True if this query deepens or extends a recent search topic.",
-                },
-                "topic_index": {
-                    "type": "integer",
-                    "description": "Index of the related recent topic (0-based). -1 if not a follow-up.",
-                },
-                "refined_query": {
-                    "type": "string",
-                    "description": (
-                        "If follow-up: a focused search query that combines the new angle with the topic context. "
-                        "If new topic: the original query, possibly rephrased for better search results."
-                    ),
-                },
-                "topic": {
-                    "type": "string",
-                    "description": "Short label for this search topic (e.g. 'football ligue 1', 'réchauffement climatique').",
-                },
-            },
-            "required": ["is_followup", "topic_index", "refined_query", "topic"],
-        },
-    },
-}]
 
 DETAIL_SYSTEM_PROMPTS = {
     1: (
@@ -150,44 +78,7 @@ REPORT_TOOL = [{
 # LLM calls
 # ---------------------------------------------------------------------------
 
-def _classify_query_sync(query: str, recent: list[SearchEntry]) -> dict:
-    if not recent:
-        return {"is_followup": False, "topic_index": -1, "refined_query": query, "topic": query[:60]}
-
-    topics_text = "\n".join(
-        f"[{i}] sujet='{e.topic}' requête='{e.query}'"
-        for i, e in enumerate(recent)
-    )
-    try:
-        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": (
-                    "You analyze a new search query and a list of recent search topics. "
-                    "Determine if the new query is a follow-up or deepening of one of the recent topics. "
-                    "A follow-up asks for more detail, a different angle, or a related aspect of the same subject. "
-                    "If it is a follow-up, generate a focused refined_query that targets the new angle within the topic context. "
-                    "Always provide a short topic label. "
-                    "Call classify_query."
-                )},
-                {"role": "user", "content": f"New query: {query}\n\nRecent topics:\n{topics_text}"},
-            ],
-            tools=CLASSIFY_TOOL,
-            tool_choice="required",
-        )
-        tool_calls = resp.choices[0].message.tool_calls
-        if not tool_calls:
-            return {"is_followup": False, "topic_index": -1, "refined_query": query, "topic": query[:60]}
-        result = json.loads(tool_calls[0].function.arguments)
-        logger.info(f"Classification requête: is_followup={result.get('is_followup')}, topic='{result.get('topic')}', refined='{result.get('refined_query')}'")
-        return result
-    except Exception as e:
-        logger.error(f"Classification échouée: {e}")
-        return {"is_followup": False, "topic_index": -1, "refined_query": query, "topic": query[:60]}
-
-
-def _synthesize_sync(query: str, results: list[dict], detail_level: int, context_report: str | None = None) -> str:
+def _synthesize_sync(query: str, results: list[dict], detail_level: int) -> str:
     system_prompt = DETAIL_SYSTEM_PROMPTS.get(detail_level, DETAIL_SYSTEM_PROMPTS[2])
 
     results_text = "\n\n".join(
@@ -196,8 +87,6 @@ def _synthesize_sync(query: str, results: list[dict], detail_level: int, context
         if r.get("content")
     )
     user_content = f"Question: {query}\n\nRésultats de recherche:\n{results_text}"
-    if context_report:
-        user_content = f"Contexte de la recherche précédente: {context_report}\n\n{user_content}"
 
     try:
         client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
@@ -316,12 +205,11 @@ def _dedup_results(results: list[dict]) -> list[dict]:
     return out
 
 
-async def _enrich_entry_background(entry: SearchEntry, results: list[dict], username: str):
-    """Fetch full page content in background and update the context entry silently."""
+async def _enrich_results_background(results: list[dict], username: str):
+    """Fetch full page content in background (logged only)."""
     try:
         enriched = await _enrich_results(results)
-        entry.results = enriched
-        logger.info(f"[{username}] Enrichissement background terminé pour '{entry.topic}' ({len(enriched)} résultats)")
+        logger.info(f"[{username}] Enrichissement background terminé ({len(enriched)} résultats)")
     except Exception as e:
         logger.warning(f"[{username}] Enrichissement background échoué: {e}")
 
@@ -384,8 +272,6 @@ async def on_user_connected(topic: str, payload):
                     "access": "read",
                     "format": {
                         "report": "string",
-                        "topic": "string",
-                        "is_followup": "bool",
                         "sources": [{"title": "string", "url": "string"}],
                     },
                 },
@@ -416,68 +302,30 @@ async def on_user_connected(topic: str, payload):
 
         logger.info(f"[{username}] Recherche: '{query}' categories={categories} n={n_results} level={detail_level}")
 
-        ctx = _get_context(username)
-        recent = ctx.recent()
-
         loop = asyncio.get_event_loop()
 
-        # 1. Classify + search in parallel (skip classify if no context)
-        if recent:
-            classification, raw_results = await asyncio.gather(
-                loop.run_in_executor(None, _classify_query_sync, query, recent),
-                _search(query, categories, n_results),
-            )
-        else:
-            classification = {"is_followup": False, "topic_index": -1, "refined_query": query, "topic": query[:60]}
-            raw_results = await _search(query, categories, n_results)
+        # 1. Search
+        raw_results = await _search(query, categories, n_results)
 
-        is_followup = classification.get("is_followup", False)
-        topic_index = classification.get("topic_index", -1)
-        refined_query = classification.get("refined_query", query)
-        topic = classification.get("topic", query[:60])
-
-        # If follow-up with a different refined query, search again with the refined query
-        if is_followup and refined_query != query:
-            new_results = await _search(refined_query, categories, n_results)
-        else:
-            new_results = raw_results
-
-        # 2. Merge with context if follow-up
-        context_report = None
-        all_results = new_results
-        if is_followup and 0 <= topic_index < len(recent):
-            parent = recent[topic_index]
-            context_report = parent.report
-            all_results = _dedup_results(parent.results + new_results)
-            logger.info(f"[{username}] Follow-up de '{parent.topic}': {len(parent.results)} résultats contexte + {len(new_results)} nouveaux = {len(all_results)} total")
-
-        if not all_results:
+        if not raw_results:
             await nexus.publish(result_topic, {
                 "report": "Je n'ai pas trouvé de résultats pour cette recherche.",
-                "topic": topic,
-                "is_followup": is_followup,
                 "sources": [],
             })
             return
 
-        # 3. Synthesize immediately from snippets → fast first response
-        report = await loop.run_in_executor(None, _synthesize_sync, query, all_results, detail_level, context_report)
+        # 2. Synthesize immediately from snippets → fast first response
+        report = await loop.run_in_executor(None, _synthesize_sync, query, raw_results, detail_level)
 
-        # 4. Store entry with snippet-only results, publish response immediately
-        entry = SearchEntry(query=query, topic=topic, results=all_results, report=report)
-        ctx.add(entry)
-
-        sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in all_results[:5]]
+        sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in raw_results[:5]]
         await nexus.publish(result_topic, {
             "report": report,
-            "topic": topic,
-            "is_followup": is_followup,
             "sources": sources,
         })
         logger.info(f"[{username}] Résultat publié sur {result_topic}")
 
-        # 5. Background: fetch full page content and enrich context for future follow-ups
-        asyncio.create_task(_enrich_entry_background(entry, new_results, username))
+        # 3. Background: fetch full page content (enriches future searches via SearXNG cache)
+        asyncio.create_task(_enrich_results_background(raw_results, username))
 
     nexus.subscribe(request_topic, on_search_request)
     nexus.start_listening()
