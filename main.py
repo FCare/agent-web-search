@@ -205,13 +205,6 @@ def _dedup_results(results: list[dict]) -> list[dict]:
     return out
 
 
-async def _enrich_results_background(results: list[dict], username: str):
-    """Fetch full page content in background (logged only)."""
-    try:
-        enriched = await _enrich_results(results)
-        logger.info(f"[{username}] Enrichissement background terminé ({len(enriched)} résultats)")
-    except Exception as e:
-        logger.warning(f"[{username}] Enrichissement background échoué: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -314,18 +307,18 @@ async def on_user_connected(topic: str, payload):
             })
             return
 
-        # 2. Synthesize immediately from snippets → fast first response
-        report = await loop.run_in_executor(None, _synthesize_sync, query, raw_results, detail_level)
+        # 2. Fetch full page content before synthesizing for accurate results
+        enriched_results = await _enrich_results(raw_results)
 
-        sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in raw_results[:5]]
+        # 3. Synthesize from enriched content
+        report = await loop.run_in_executor(None, _synthesize_sync, query, enriched_results, detail_level)
+
+        sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in enriched_results[:5]]
         await nexus.publish(result_topic, {
             "report": report,
             "sources": sources,
         })
         logger.info(f"[{username}] Résultat publié sur {result_topic}")
-
-        # 3. Background: fetch full page content (enriches future searches via SearXNG cache)
-        asyncio.create_task(_enrich_results_background(raw_results, username))
 
     nexus.subscribe(request_topic, on_search_request)
     nexus.start_listening()
