@@ -31,7 +31,7 @@ FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "8"))
 FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "3000"))
 
 AGENT_NAME = "search"
-_subscribed_users: set[str] = set()
+_subscribed_sessions: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # LLM tools
@@ -217,9 +217,10 @@ async def on_user_connected(topic: str, payload):
 
     username = payload.get("username")
     password = payload.get("password")
+    session_id = payload.get("session_id")
     private_topics = payload.get("private_topics", [])
 
-    if not username or not password:
+    if not username or not password or not session_id:
         return
 
     agent_topics_topic = None
@@ -233,8 +234,8 @@ async def on_user_connected(topic: str, payload):
         logger.warning(f"[{username}] agent_topics topic introuvable, skip")
         return
 
-    request_topic = f"users/{username}/search/request"
-    result_topic = f"users/{username}/search/result"
+    request_topic = f"users/{username}/{session_id}/search/request"
+    result_topic = f"users/{username}/{session_id}/search/result"
 
     nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
 
@@ -271,13 +272,13 @@ async def on_user_connected(topic: str, payload):
             ],
         }],
     )
-    logger.info(f"[{username}] Topics déclarés sur {agent_topics_topic}")
+    logger.info(f"[{username}/{session_id}] Topics déclarés sur {agent_topics_topic}")
 
-    if username in _subscribed_users:
-        logger.debug(f"[{username}] Déjà abonné, skip")
+    if session_id in _subscribed_sessions:
+        logger.debug(f"[{username}/{session_id}] Déjà abonné, skip")
         return
 
-    _subscribed_users.add(username)
+    _subscribed_sessions.add(session_id)
 
     async def on_search_request(t: str, p):
         if not isinstance(p, dict):
@@ -318,11 +319,11 @@ async def on_user_connected(topic: str, payload):
             "report": report,
             "sources": sources,
         })
-        logger.info(f"[{username}] Résultat publié sur {result_topic}")
+        logger.info(f"[{username}/{session_id}] Résultat publié sur {result_topic}")
 
     nexus.subscribe(request_topic, on_search_request)
     nexus.start_listening()
-    logger.info(f"[{username}] Abonné à {request_topic}")
+    logger.info(f"[{username}/{session_id}] Abonné à {request_topic}")
 
 
 async def main():
