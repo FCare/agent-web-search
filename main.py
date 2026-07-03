@@ -98,6 +98,7 @@ def _synthesize_sync(query: str, results: list[dict], detail_level: int) -> str:
             ],
             tools=REPORT_TOOL,
             tool_choice="required",
+            max_tokens=600,
         )
         tool_calls = resp.choices[0].message.tool_calls
         if not tool_calls:
@@ -326,9 +327,46 @@ async def on_user_connected(topic: str, payload):
     logger.info(f"[{username}/{session_id}] Abonné à {request_topic}")
 
 
+SERVICE_REQUEST_TOPIC = "service/search/request"
+SERVICE_RESULT_TOPIC  = "service/search/result"
+
+
 async def main():
     nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+
+    async def on_service_search_request(topic: str, payload):
+        if not isinstance(payload, dict):
+            return
+        query = payload.get("query", "").strip()
+        if not query:
+            return
+        reply_to     = payload.get("reply_to", SERVICE_RESULT_TOPIC)
+        categories   = payload.get("categories", "general")
+        n_results    = int(payload.get("n_results", DEFAULT_N_RESULTS))
+        detail_level = int(payload.get("detail_level", 2))
+        if detail_level not in (1, 2, 3):
+            detail_level = 2
+        logger.info(f"[service] Recherche: {query!r} categories={categories}")
+        try:
+            raw = await _search(query, categories, n_results)
+            if not raw:
+                await nexus.publish(reply_to, {"report": "", "sources": []})
+                return
+            enriched = await _enrich_results(raw)
+            parts = [
+                f"[{r.get('title', '')}]\nSource: {r.get('url', '')}\n{(r.get('content') or '')[:1500]}"
+                for r in enriched if r.get("content") or r.get("title")
+            ]
+            report = "\n\n---\n\n".join(parts)
+            sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in enriched[:5]]
+            await nexus.publish(reply_to, {"report": report, "sources": sources})
+            logger.info(f"[service] Résultat publié ({len(report)} chars)")
+        except Exception as e:
+            logger.error(f"[service] Erreur recherche {query!r}: {e}")
+            await nexus.publish(reply_to, {"report": "", "sources": []})
+
     nexus.subscribe("common/user_connected", on_user_connected)
+    nexus.subscribe(SERVICE_REQUEST_TOPIC, on_service_search_request)
     nexus.start_listening()
     logger.info(f"Search service démarré — SearXNG: {SEARXNG_URL}")
     await asyncio.Event().wait()
