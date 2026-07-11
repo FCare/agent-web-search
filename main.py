@@ -29,6 +29,10 @@ DEFAULT_N_RESULTS = int(os.environ.get("DEFAULT_N_RESULTS", "4"))
 FETCH_TOP_N = int(os.environ.get("FETCH_TOP_N", "4"))
 FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "8"))
 FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "3000"))
+TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+TAVILY_URL = "https://api.tavily.com/search"
+ANYSEARCH_API_KEY = os.environ.get("ANYSEARCH_API_KEY", "")
+ANYSEARCH_URL = "https://api.anysearch.com/v1/search"
 
 AGENT_NAME = "search"
 _subscribed_sessions: set[str] = set()
@@ -111,9 +115,82 @@ def _synthesize_sync(query: str, results: list[dict], detail_level: int) -> str:
         return results_text[:500]
 
 
+JUDGE_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "judge_relevance",
+        "description": "State whether the search results clearly and currently answer the question.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "answered": {
+                    "type": "boolean",
+                    "description": (
+                        "True only if the results give a clear, current, factual answer. "
+                        "False if they are off-topic (e.g. dictionary definitions of a word "
+                        "in the question), or describe the event as still pending/undecided "
+                        "at the time of the question."
+                    ),
+                }
+            },
+            "required": ["answered"],
+        },
+    },
+}]
+
+
+def _judge_sync(query: str, results: list[dict]) -> bool:
+    """Appel LLM court : les résultats SearXNG répondent-ils vraiment à la question ?
+    Remplace un seuil sur la longueur du contenu, qui ne distingue ni le hors-sujet
+    verbeux (pages de dictionnaire) ni le contenu pertinent mais périmé."""
+    results_text = "\n\n".join(
+        f"[{i+1}] {r.get('title', '')}\n{(r.get('content') or '')[:500]}"
+        for i, r in enumerate(results[:8])
+        if r.get("content")
+    )
+    if not results_text:
+        return False
+    try:
+        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "Tu juges la pertinence de résultats de recherche pour une question donnée."},
+                {"role": "user", "content": f"Question: {query}\n\nRésultats:\n{results_text}"},
+            ],
+            tools=JUDGE_TOOL,
+            tool_choice="required",
+            max_tokens=50,
+        )
+        tool_calls = resp.choices[0].message.tool_calls
+        if not tool_calls:
+            return True  # échec du tool-calling : ne pas bloquer sur une erreur de jugement
+        answered = json.loads(tool_calls[0].function.arguments).get("answered", True)
+        logger.info(f"Juge: answered={answered}")
+        return bool(answered)
+    except Exception as e:
+        logger.error(f"Jugement échoué: {e}")
+        return True  # fail-open : en cas d'erreur, ne pas consommer le quota Tavily pour rien
+
+
 # ---------------------------------------------------------------------------
 # SearXNG
 # ---------------------------------------------------------------------------
+
+# Sites de dictionnaire/définition/mots-fléchés : toujours assez longs pour
+# passer le filtre de qualité par longueur, mais jamais pertinents pour une
+# question factuelle — la requête matche le MOT ('vainqueur', 'adversaire'),
+# pas le SUJET recherché. À exclure par nom plutôt que par longueur.
+_NOISE_DOMAINS = (
+    "larousse.fr", "lerobert.com", "cnrtl.fr", "wiktionary.org",
+    "fsolver.fr", "wordreference.com", "linternaute.fr/dictionnaire",
+    "synonymes.com", "cordial.fr",
+)
+
+
+def _is_reference_noise(url: str) -> bool:
+    return any(d in url for d in _NOISE_DOMAINS)
+
 
 async def _search(query: str, categories: str, n: int) -> list[dict]:
     try:
@@ -131,7 +208,8 @@ async def _search(query: str, categories: str, n: int) -> list[dict]:
             ) as resp:
                 resp.raise_for_status()
                 data = await resp.json()
-                results = data.get("results", [])[:n]
+                all_results = [r for r in data.get("results", []) if not _is_reference_noise(r.get("url", ""))]
+                results = all_results[:n]
                 logger.info(f"SearXNG '{query}' ({categories}): {len(results)} résultats")
                 return results
     except Exception as e:
@@ -206,6 +284,102 @@ def _dedup_results(results: list[dict]) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Tavily (fallback quand SearXNG renvoie peu/pas de contenu exploitable)
+# ---------------------------------------------------------------------------
+
+async def _tavily_search(query: str, categories: str, n: int) -> list[dict]:
+    if not TAVILY_API_KEY:
+        return []
+    topic = "news" if categories == "news" else "general"
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "topic": topic,
+        "search_depth": "advanced",
+        "max_results": min(n, 10),
+        "include_raw_content": True,
+    }
+    if topic == "news":
+        payload["time_range"] = "week"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                TAVILY_URL, json=payload, timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                results = [
+                    {
+                        "title": r.get("title", ""),
+                        "url": r.get("url", ""),
+                        "content": (r.get("raw_content") or r.get("content") or "")[:FETCH_MAX_CHARS],
+                    }
+                    for r in data.get("results", [])[:n]
+                ]
+                logger.info(f"Tavily '{query}' ({topic}): {len(results)} résultats")
+                return results
+    except Exception as e:
+        logger.error(f"Tavily échoué: {e}")
+        return []
+
+
+async def _anysearch_search(query: str, n: int) -> list[dict]:
+    if not ANYSEARCH_API_KEY:
+        return []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                ANYSEARCH_URL,
+                headers={"Authorization": f"Bearer {ANYSEARCH_API_KEY}"},
+                json={"query": query, "max_results": n},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                results = [
+                    {
+                        "title": r.get("title", ""),
+                        "url": r.get("url", ""),
+                        "content": (r.get("content") or r.get("snippet") or "")[:FETCH_MAX_CHARS],
+                    }
+                    for r in data.get("data", {}).get("results", [])[:n]
+                ]
+                logger.info(f"AnySearch '{query}': {len(results)} résultats")
+                return results
+    except Exception as e:
+        logger.error(f"AnySearch échoué: {e}")
+        return []
+
+
+async def _search_with_fallback(query: str, categories: str, n: int, log_prefix: str = "",
+                                 allow_tavily: bool = True) -> list[dict]:
+    """SearXNG (multi-moteurs, gratuit) et AnySearch (quota généreux) sont
+    toujours interrogés en parallèle, quel que soit le résultat de l'un ou
+    l'autre. Un LLM juge ensuite si l'ensemble combiné répond vraiment à la
+    question — hors-sujet ou périmé compte comme non-réponse — et Tavily
+    (quota rare) prend le relais seulement dans ce cas, sauf si allow_tavily=False
+    (appels à fort volume, ex: le deep dive du bulletin news)."""
+    raw_results, anysearch_results = await asyncio.gather(
+        _search(query, categories, n),
+        _anysearch_search(query, n),
+    )
+    enriched = await _enrich_results(raw_results) if raw_results else []
+    combined = _dedup_results(enriched + anysearch_results)
+
+    if not allow_tavily:
+        return combined
+
+    loop = asyncio.get_event_loop()
+    answered = await loop.run_in_executor(None, _judge_sync, query, combined) if combined else False
+
+    if not answered:
+        tavily_results = await _tavily_search(query, categories, n)
+        if tavily_results:
+            logger.info(f"{log_prefix} SearXNG+AnySearch ne répondent pas à la question — fallback Tavily")
+            return tavily_results
+
+    return combined
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +461,11 @@ async def on_user_connected(topic: str, payload):
 
         query = p.get("query", "").strip()
         if not query:
+            logger.warning(f"[{username}/{session_id}] Requête sans 'query', ignorée: {p}")
+            await nexus.publish(result_topic, {
+                "report": "Erreur: la requête de recherche ne contenait pas de terme à chercher.",
+                "sources": [],
+            })
             return
 
         categories = p.get("categories", "general")
@@ -294,25 +473,25 @@ async def on_user_connected(topic: str, payload):
         detail_level = int(p.get("detail_level", 2))
         if detail_level not in (1, 2, 3):
             detail_level = 2
+        allow_tavily = bool(p.get("allow_tavily", True))
 
         logger.info(f"[{username}] Recherche: '{query}' categories={categories} n={n_results} level={detail_level}")
 
         loop = asyncio.get_event_loop()
 
-        # 1. Search
-        raw_results = await _search(query, categories, n_results)
+        # 1. Search (SearXNG, fallback Tavily si résultats pauvres)
+        enriched_results = await _search_with_fallback(
+            query, categories, n_results, log_prefix=f"[{username}/{session_id}]", allow_tavily=allow_tavily
+        )
 
-        if not raw_results:
+        if not enriched_results:
             await nexus.publish(result_topic, {
                 "report": "Je n'ai pas trouvé de résultats pour cette recherche.",
                 "sources": [],
             })
             return
 
-        # 2. Fetch full page content before synthesizing for accurate results
-        enriched_results = await _enrich_results(raw_results)
-
-        # 3. Synthesize from enriched content
+        # 2. Synthesize from enriched content
         report = await loop.run_in_executor(None, _synthesize_sync, query, enriched_results, detail_level)
 
         sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in enriched_results[:5]]
@@ -338,21 +517,23 @@ async def main():
         if not isinstance(payload, dict):
             return
         query = payload.get("query", "").strip()
-        if not query:
-            return
         reply_to     = payload.get("reply_to", SERVICE_RESULT_TOPIC)
+        if not query:
+            logger.warning(f"[service] Requête sans 'query', ignorée: {payload}")
+            await nexus.publish(reply_to, {"report": "Erreur: la requête de recherche ne contenait pas de terme à chercher.", "sources": []})
+            return
         categories   = payload.get("categories", "general")
         n_results    = int(payload.get("n_results", DEFAULT_N_RESULTS))
         detail_level = int(payload.get("detail_level", 2))
         if detail_level not in (1, 2, 3):
             detail_level = 2
+        allow_tavily = bool(payload.get("allow_tavily", True))
         logger.info(f"[service] Recherche: {query!r} categories={categories}")
         try:
-            raw = await _search(query, categories, n_results)
-            if not raw:
+            enriched = await _search_with_fallback(query, categories, n_results, log_prefix="[service]", allow_tavily=allow_tavily)
+            if not enriched:
                 await nexus.publish(reply_to, {"report": "", "sources": []})
                 return
-            enriched = await _enrich_results(raw)
             parts = [
                 f"[{r.get('title', '')}]\nSource: {r.get('url', '')}\n{(r.get('content') or '')[:1500]}"
                 for r in enriched if r.get("content") or r.get("title")
