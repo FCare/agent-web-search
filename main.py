@@ -422,9 +422,9 @@ async def on_user_connected(topic: str, payload):
                 {
                     "topic": request_topic,
                     "description": (
-                        "Recherche sur internet via SearXNG. "
-                        "Utiliser pour toute question factuelle sur un sujet précis, une personne, un lieu, une définition, une valeur boursière ou un événement ciblé. "
-                        "Catégories disponibles: general, news, science, it, social+media, map, music, videos, images."
+                        "Recherche sur internet via SearXNG — pour toute question factuelle "
+                        "précise (sujet, personne, lieu, définition, valeur boursière, événement). "
+                        "Catégories: general, news, science, it, social+media, map, music, videos, images."
                     ),
                     "access": "write",
                     "response_topic": result_topic,
