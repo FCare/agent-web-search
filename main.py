@@ -16,11 +16,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VK_URL = os.environ["VK_URL"]
 MQTT_HOST = os.environ["MQTT_HOST"]
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-SERVICE_USERNAME = os.environ["MQTT_SERVICE_USERNAME"]
-SERVICE_API_KEY = os.environ["MQTT_SERVICE_API_KEY"]
+
+# Authentik OAuth
+AUTHENTIK_URL = os.environ.get("AUTHENTIK_URL", "https://sso.caronboulme.fr")
+AUTHENTIK_CLIENT_ID = os.environ["AUTHENTIK_CLIENT_ID"]
+AUTHENTIK_CLIENT_SECRET = os.environ["AUTHENTIK_CLIENT_SECRET"]
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://thebrain.caronboulme.fr/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
@@ -36,6 +38,43 @@ ANYSEARCH_URL = "https://api.anysearch.com/v1/search"
 
 AGENT_NAME = "search"
 _subscribed_sessions: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# MQTT Connection Helper
+# ---------------------------------------------------------------------------
+
+async def create_nexus_client() -> NexusClient:
+    """Crée un NexusClient connecté via Authentik OAuth."""
+    import httpx
+
+    logger.info("Connexion MQTT via Authentik OAuth...")
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{AUTHENTIK_URL}/application/o/token/",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": AUTHENTIK_CLIENT_ID,
+                "client_secret": AUTHENTIK_CLIENT_SECRET,
+            },
+        )
+        if resp.status_code != 200:
+            logger.error(f"Échec obtention token OAuth: {resp.status_code} {resp.text}")
+            raise RuntimeError("Cannot get OAuth token")
+
+        token_data = resp.json()
+        access_token = token_data["access_token"]
+        logger.info(f"Token OAuth obtenu (expire dans {token_data['expires_in']}s)")
+
+    nexus = await NexusClient.from_authentik_token(
+        AUTHENTIK_URL,
+        MQTT_HOST,
+        access_token,
+        AUTHENTIK_CLIENT_ID,
+        AUTHENTIK_CLIENT_SECRET,
+        MQTT_PORT,
+    )
+    logger.info(f"NexusClient créé avec username: {nexus._username}")
+    return nexus
 
 # ---------------------------------------------------------------------------
 # LLM tools
@@ -412,7 +451,7 @@ async def on_user_connected(topic: str, payload):
     request_topic = f"users/{username}/{session_id}/search/request"
     result_topic = f"users/{username}/{session_id}/search/result"
 
-    nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+    nexus = await create_nexus_client()
 
     await nexus.publish(
         agent_topics_topic,
@@ -457,9 +496,16 @@ async def on_user_connected(topic: str, payload):
 
     async def on_search_request(t: str, p):
         if not isinstance(p, dict):
+            logger.warning(f"[{username}/{session_id}] Payload non-JSON/non-dict reçu sur {t}, ignoré: {p!r}")
+            await nexus.publish(result_topic, {
+                "report": "",
+                "sources": [],
+                "error": "malformed request payload: expected a JSON object",
+            })
             return
 
-        query = p.get("query", "").strip()
+        raw_query = p.get("query", "")
+        query = raw_query.strip() if isinstance(raw_query, str) else ""
         if not query:
             logger.warning(f"[{username}/{session_id}] Requête sans 'query', ignorée: {p}")
             await nexus.publish(result_topic, {
@@ -468,38 +514,46 @@ async def on_user_connected(topic: str, payload):
             })
             return
 
-        categories = p.get("categories", "general")
-        n_results = int(p.get("n_results", DEFAULT_N_RESULTS))
-        detail_level = int(p.get("detail_level", 2))
-        if detail_level not in (1, 2, 3):
-            detail_level = 2
-        allow_tavily = bool(p.get("allow_tavily", True))
+        try:
+            categories = p.get("categories", "general")
+            n_results = int(p.get("n_results", DEFAULT_N_RESULTS))
+            detail_level = int(p.get("detail_level", 2))
+            if detail_level not in (1, 2, 3):
+                detail_level = 2
+            allow_tavily = bool(p.get("allow_tavily", True))
 
-        logger.info(f"[{username}] Recherche: '{query}' categories={categories} n={n_results} level={detail_level}")
+            logger.info(f"[{username}] Recherche: '{query}' categories={categories} n={n_results} level={detail_level}")
 
-        loop = asyncio.get_event_loop()
+            loop = asyncio.get_event_loop()
 
-        # 1. Search (SearXNG, fallback Tavily si résultats pauvres)
-        enriched_results = await _search_with_fallback(
-            query, categories, n_results, log_prefix=f"[{username}/{session_id}]", allow_tavily=allow_tavily
-        )
+            # 1. Search (SearXNG, fallback Tavily si résultats pauvres)
+            enriched_results = await _search_with_fallback(
+                query, categories, n_results, log_prefix=f"[{username}/{session_id}]", allow_tavily=allow_tavily
+            )
 
-        if not enriched_results:
+            if not enriched_results:
+                await nexus.publish(result_topic, {
+                    "report": "Je n'ai pas trouvé de résultats pour cette recherche.",
+                    "sources": [],
+                })
+                return
+
+            # 2. Synthesize from enriched content
+            report = await loop.run_in_executor(None, _synthesize_sync, query, enriched_results, detail_level)
+
+            sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in enriched_results[:5]]
             await nexus.publish(result_topic, {
-                "report": "Je n'ai pas trouvé de résultats pour cette recherche.",
-                "sources": [],
+                "report": report,
+                "sources": sources,
             })
-            return
-
-        # 2. Synthesize from enriched content
-        report = await loop.run_in_executor(None, _synthesize_sync, query, enriched_results, detail_level)
-
-        sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in enriched_results[:5]]
-        await nexus.publish(result_topic, {
-            "report": report,
-            "sources": sources,
-        })
-        logger.info(f"[{username}/{session_id}] Résultat publié sur {result_topic}")
+            logger.info(f"[{username}/{session_id}] Résultat publié sur {result_topic}")
+        except Exception as e:
+            logger.exception(f"[{username}/{session_id}] Erreur inattendue lors du traitement de la requête search: {e}")
+            await nexus.publish(result_topic, {
+                "report": "",
+                "sources": [],
+                "error": f"internal search error: {e}",
+            })
 
     nexus.subscribe(request_topic, on_search_request)
     nexus.start_listening()
@@ -511,25 +565,34 @@ SERVICE_RESULT_TOPIC  = "service/search/result"
 
 
 async def main():
-    nexus = NexusClient.from_api_key(VK_URL, MQTT_HOST, SERVICE_USERNAME, SERVICE_API_KEY, MQTT_PORT)
+    nexus = await create_nexus_client()
 
     async def on_service_search_request(topic: str, payload):
         if not isinstance(payload, dict):
+            logger.warning(f"[service] Payload non-JSON/non-dict reçu sur {topic}, ignoré: {payload!r}")
+            await nexus.publish(SERVICE_RESULT_TOPIC, {
+                "report": "",
+                "sources": [],
+                "error": "malformed request payload: expected a JSON object",
+            })
             return
-        query = payload.get("query", "").strip()
-        reply_to     = payload.get("reply_to", SERVICE_RESULT_TOPIC)
+
+        reply_to = payload.get("reply_to", SERVICE_RESULT_TOPIC)
+        raw_query = payload.get("query", "")
+        query = raw_query.strip() if isinstance(raw_query, str) else ""
         if not query:
             logger.warning(f"[service] Requête sans 'query', ignorée: {payload}")
             await nexus.publish(reply_to, {"report": "Erreur: la requête de recherche ne contenait pas de terme à chercher.", "sources": []})
             return
-        categories   = payload.get("categories", "general")
-        n_results    = int(payload.get("n_results", DEFAULT_N_RESULTS))
-        detail_level = int(payload.get("detail_level", 2))
-        if detail_level not in (1, 2, 3):
-            detail_level = 2
-        allow_tavily = bool(payload.get("allow_tavily", True))
-        logger.info(f"[service] Recherche: {query!r} categories={categories}")
         try:
+            categories   = payload.get("categories", "general")
+            n_results    = int(payload.get("n_results", DEFAULT_N_RESULTS))
+            detail_level = int(payload.get("detail_level", 2))
+            if detail_level not in (1, 2, 3):
+                detail_level = 2
+            allow_tavily = bool(payload.get("allow_tavily", True))
+            logger.info(f"[service] Recherche: {query!r} categories={categories}")
+
             enriched = await _search_with_fallback(query, categories, n_results, log_prefix="[service]", allow_tavily=allow_tavily)
             if not enriched:
                 await nexus.publish(reply_to, {"report": "", "sources": []})
@@ -544,7 +607,7 @@ async def main():
             logger.info(f"[service] Résultat publié ({len(report)} chars)")
         except Exception as e:
             logger.error(f"[service] Erreur recherche {query!r}: {e}")
-            await nexus.publish(reply_to, {"report": "", "sources": []})
+            await nexus.publish(reply_to, {"report": "", "sources": [], "error": f"internal search error: {e}"})
 
     nexus.subscribe("common/user_connected", on_user_connected)
     nexus.subscribe(SERVICE_REQUEST_TOPIC, on_service_search_request)
