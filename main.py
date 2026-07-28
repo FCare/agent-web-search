@@ -7,6 +7,8 @@ import sys
 import aiohttp
 import openai
 import trafilatura
+from ddgs import DDGS
+from ddgs.exceptions import DDGSException
 from nexus_client import NexusClient
 
 logging.basicConfig(
@@ -31,10 +33,25 @@ DEFAULT_N_RESULTS = int(os.environ.get("DEFAULT_N_RESULTS", "4"))
 FETCH_TOP_N = int(os.environ.get("FETCH_TOP_N", "4"))
 FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "8"))
 FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "3000"))
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
-TAVILY_URL = "https://api.tavily.com/search"
 ANYSEARCH_API_KEY = os.environ.get("ANYSEARCH_API_KEY", "")
 ANYSEARCH_URL = "https://api.anysearch.com/v1/search"
+
+# Backends ddgs interrogés dans l'ordre, le premier qui répond gagne. Mesuré le
+# 28/07/2026 depuis cette IP : en text bing/yandex/yahoo répondent, brave,
+# duckduckgo, google, mojeek et startpage renvoient systématiquement "No results
+# found" ; en news bing et duckduckgo répondent, yahoo non. Les inutiles sont
+# écartés pour ne pas payer un aller-retour à vide avant le backend qui marche.
+DDGS_TEXT_BACKENDS = os.environ.get("DDGS_TEXT_BACKENDS", "bing,yandex,yahoo").split(",")
+DDGS_NEWS_BACKENDS = os.environ.get("DDGS_NEWS_BACKENDS", "bing,duckduckgo").split(",")
+DDGS_TIMEOUT = int(os.environ.get("DDGS_TIMEOUT", "20"))
+DDGS_REGION = os.environ.get("DDGS_REGION", "fr-fr")
+
+# Catégories servies par ddgs plutôt que par SearXNG : ce sont celles où les
+# moteurs web généralistes de SearXNG se font bloquer (CAPTCHA/429). Les autres
+# (science, it, music, videos, images, social media, map) restent sur SearXNG,
+# qui y agrège des sources spécialisées que ddgs n'a pas (pubmed, arxiv, github,
+# stackoverflow, mastodon...).
+DDGS_CATEGORIES = {"general", "news"}
 
 AGENT_NAME = "search"
 _subscribed_sessions: set[str] = set()
@@ -154,64 +171,6 @@ def _synthesize_sync(query: str, results: list[dict], detail_level: int) -> str:
         return results_text[:500]
 
 
-JUDGE_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "judge_relevance",
-        "description": "State whether the search results clearly and currently answer the question.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "answered": {
-                    "type": "boolean",
-                    "description": (
-                        "True only if the results give a clear, current, factual answer. "
-                        "False if they are off-topic (e.g. dictionary definitions of a word "
-                        "in the question), or describe the event as still pending/undecided "
-                        "at the time of the question."
-                    ),
-                }
-            },
-            "required": ["answered"],
-        },
-    },
-}]
-
-
-def _judge_sync(query: str, results: list[dict]) -> bool:
-    """Appel LLM court : les résultats SearXNG répondent-ils vraiment à la question ?
-    Remplace un seuil sur la longueur du contenu, qui ne distingue ni le hors-sujet
-    verbeux (pages de dictionnaire) ni le contenu pertinent mais périmé."""
-    results_text = "\n\n".join(
-        f"[{i+1}] {r.get('title', '')}\n{(r.get('content') or '')[:500]}"
-        for i, r in enumerate(results[:8])
-        if r.get("content")
-    )
-    if not results_text:
-        return False
-    try:
-        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": "Tu juges la pertinence de résultats de recherche pour une question donnée."},
-                {"role": "user", "content": f"Question: {query}\n\nRésultats:\n{results_text}"},
-            ],
-            tools=JUDGE_TOOL,
-            tool_choice="required",
-            max_tokens=50,
-        )
-        tool_calls = resp.choices[0].message.tool_calls
-        if not tool_calls:
-            return True  # échec du tool-calling : ne pas bloquer sur une erreur de jugement
-        answered = json.loads(tool_calls[0].function.arguments).get("answered", True)
-        logger.info(f"Juge: answered={answered}")
-        return bool(answered)
-    except Exception as e:
-        logger.error(f"Jugement échoué: {e}")
-        return True  # fail-open : en cas d'erreur, ne pas consommer le quota Tavily pour rien
-
-
 # ---------------------------------------------------------------------------
 # SearXNG
 # ---------------------------------------------------------------------------
@@ -324,43 +283,56 @@ def _dedup_results(results: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Tavily (fallback quand SearXNG renvoie peu/pas de contenu exploitable)
+# ddgs — métamoteur qui imite l'empreinte TLS d'un navigateur (via primp), là où
+# SearXNG se fait renvoyer un CAPTCHA par les moteurs web généralistes.
 # ---------------------------------------------------------------------------
 
-async def _tavily_search(query: str, categories: str, n: int) -> list[dict]:
-    if not TAVILY_API_KEY:
-        return []
-    topic = "news" if categories == "news" else "general"
-    payload = {
-        "api_key": TAVILY_API_KEY,
-        "query": query,
-        "topic": topic,
-        "search_depth": "advanced",
-        "max_results": min(n, 10),
-        "include_raw_content": True,
-    }
-    if topic == "news":
-        payload["time_range"] = "week"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                TAVILY_URL, json=payload, timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                results = [
-                    {
-                        "title": r.get("title", ""),
-                        "url": r.get("url", ""),
-                        "content": (r.get("raw_content") or r.get("content") or "")[:FETCH_MAX_CHARS],
-                    }
-                    for r in data.get("results", [])[:n]
-                ]
-                logger.info(f"Tavily '{query}' ({topic}): {len(results)} résultats")
-                return results
-    except Exception as e:
-        logger.error(f"Tavily échoué: {e}")
-        return []
+def _ddgs_search_sync(query: str, categories: str, n: int) -> list[dict]:
+    """Interroge les backends ddgs dans l'ordre, s'arrête au premier qui répond.
+
+    ddgs est synchrone et bloquant : à appeler dans un executor.
+    """
+    is_news = categories == "news"
+    backends = DDGS_NEWS_BACKENDS if is_news else DDGS_TEXT_BACKENDS
+
+    for backend in backends:
+        backend = backend.strip()
+        if not backend:
+            continue
+        try:
+            client = DDGS(timeout=DDGS_TIMEOUT)
+            search = client.news if is_news else client.text
+            raw = search(query, backend=backend, max_results=n, region=DDGS_REGION)
+        except DDGSException as e:
+            # "No results found" inclus : un backend bloqué lève ici, on essaie le suivant.
+            logger.info(f"ddgs[{backend}] '{query[:50]}': {e}")
+            continue
+        except Exception as e:
+            logger.warning(f"ddgs[{backend}] erreur inattendue: {type(e).__name__}: {e}")
+            continue
+
+        results = [
+            {
+                "title": r.get("title", ""),
+                "url": r.get("href") or r.get("url", ""),
+                # text() renvoie 'body', news() renvoie 'body' aussi : ce n'est
+                # qu'un extrait, _enrich_results ira chercher la page entière.
+                "content": (r.get("body") or "")[:FETCH_MAX_CHARS],
+            }
+            for r in raw
+            if not _is_reference_noise(r.get("href") or r.get("url", ""))
+        ]
+        if results:
+            logger.info(f"ddgs[{backend}] '{query[:50]}' ({categories}): {len(results)} résultats")
+            return results[:n]
+
+    logger.warning(f"ddgs: aucun backend n'a répondu pour '{query[:50]}' ({categories})")
+    return []
+
+
+async def _ddgs_search(query: str, categories: str, n: int) -> list[dict]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _ddgs_search_sync, query, categories, n)
 
 
 async def _anysearch_search(query: str, n: int) -> list[dict]:
@@ -391,34 +363,28 @@ async def _anysearch_search(query: str, n: int) -> list[dict]:
         return []
 
 
-async def _search_with_fallback(query: str, categories: str, n: int, log_prefix: str = "",
-                                 allow_tavily: bool = True) -> list[dict]:
-    """SearXNG (multi-moteurs, gratuit) et AnySearch (quota généreux) sont
-    toujours interrogés en parallèle, quel que soit le résultat de l'un ou
-    l'autre. Un LLM juge ensuite si l'ensemble combiné répond vraiment à la
-    question — hors-sujet ou périmé compte comme non-réponse — et Tavily
-    (quota rare) prend le relais seulement dans ce cas, sauf si allow_tavily=False
-    (appels à fort volume, ex: le deep dive du bulletin news)."""
-    raw_results, anysearch_results = await asyncio.gather(
-        _search(query, categories, n),
-        _anysearch_search(query, n),
-    )
-    enriched = await _enrich_results(raw_results) if raw_results else []
-    combined = _dedup_results(enriched + anysearch_results)
+async def _search_with_fallback(query: str, categories: str, n: int, log_prefix: str = "") -> list[dict]:
+    """Route la requête vers le moteur adapté à la catégorie, puis enrichit.
 
-    if not allow_tavily:
-        return combined
+    general et news vont chez ddgs, qui passe là où les moteurs web de SearXNG
+    se font bloquer ; AnySearch prend le relais si aucun backend ddgs ne répond.
+    Les autres catégories vont chez SearXNG, seul à agréger les sources
+    spécialisées correspondantes (pubmed, arxiv, github, mastodon...).
 
-    loop = asyncio.get_event_loop()
-    answered = await loop.run_in_executor(None, _judge_sync, query, combined) if combined else False
+    Dans les deux cas les résultats ne portent qu'un extrait : _enrich_results
+    va chercher le contenu réel des pages.
+    """
+    if categories in DDGS_CATEGORIES:
+        results = await _ddgs_search(query, categories, n)
+        if not results:
+            logger.info(f"{log_prefix} ddgs muet — fallback AnySearch")
+            results = await _anysearch_search(query, n)
+    else:
+        results = await _search(query, categories, n)
 
-    if not answered:
-        tavily_results = await _tavily_search(query, categories, n)
-        if tavily_results:
-            logger.info(f"{log_prefix} SearXNG+AnySearch ne répondent pas à la question — fallback Tavily")
-            return tavily_results
-
-    return combined
+    if not results:
+        return []
+    return _dedup_results(await _enrich_results(results))
 
 
 # ---------------------------------------------------------------------------
@@ -520,15 +486,13 @@ async def on_user_connected(topic: str, payload):
             detail_level = int(p.get("detail_level", 2))
             if detail_level not in (1, 2, 3):
                 detail_level = 2
-            allow_tavily = bool(p.get("allow_tavily", True))
-
             logger.info(f"[{username}] Recherche: '{query}' categories={categories} n={n_results} level={detail_level}")
 
             loop = asyncio.get_event_loop()
 
-            # 1. Search (SearXNG, fallback Tavily si résultats pauvres)
+            # 1. Search (ddgs ou SearXNG selon la catégorie, fallback AnySearch)
             enriched_results = await _search_with_fallback(
-                query, categories, n_results, log_prefix=f"[{username}/{session_id}]", allow_tavily=allow_tavily
+                query, categories, n_results, log_prefix=f"[{username}/{session_id}]"
             )
 
             if not enriched_results:
@@ -590,10 +554,9 @@ async def main():
             detail_level = int(payload.get("detail_level", 2))
             if detail_level not in (1, 2, 3):
                 detail_level = 2
-            allow_tavily = bool(payload.get("allow_tavily", True))
             logger.info(f"[service] Recherche: {query!r} categories={categories}")
 
-            enriched = await _search_with_fallback(query, categories, n_results, log_prefix="[service]", allow_tavily=allow_tavily)
+            enriched = await _search_with_fallback(query, categories, n_results, log_prefix="[service]")
             if not enriched:
                 await nexus.publish(reply_to, {"report": "", "sources": []})
                 return

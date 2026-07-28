@@ -29,11 +29,17 @@ outgoing:
   enable_http2: true
 
 engines:
+  # Les moteurs marqués disabled ci-dessous nous répondent CAPTCHA, 429 ou
+  # "accès refusé" depuis cette IP (mesuré le 28/07/2026). Les laisser actifs
+  # ne rapporte aucun résultat et fait payer leur timeout à chaque requête.
+  # Les catégories general et news ne passent plus par SearXNG de toute façon,
+  # elles sont servies par ddgs (voir _ddgs_search dans main.py).
+
   # --- General ---
   - name: google
     engine: google
     categories: general, news
-    disabled: false
+    disabled: true
     weight: 2
 
   - name: bing
@@ -49,12 +55,12 @@ engines:
   - name: brave
     engine: brave
     categories: general, news
-    disabled: false
+    disabled: true
 
   - name: qwant
     engine: qwant
     categories: general, news, images
-    disabled: false
+    disabled: true
     weight: 2
 
   - name: startpage
@@ -145,16 +151,19 @@ engines:
     disabled: false
 
   # --- Social media ---
+  # reddit bloque les requêtes non authentifiées ; mastodon et lemmy (défauts
+  # SearXNG) portent la catégorie à eux seuls.
   - name: reddit
     engine: reddit
     categories: social media
-    disabled: false
+    disabled: true
 
   # --- Maps ---
+  # openstreetmap ne répond plus ; photon (même base de données) le remplace.
   - name: openstreetmap
     engine: openstreetmap
     categories: map
-    disabled: false
+    disabled: true
 
   - name: photon
     engine: photon
@@ -182,10 +191,57 @@ engines:
   - name: google images
     engine: google_images
     categories: images
-    disabled: false
+    disabled: true
 
   - name: bing images
     engine: bing_images
     categories: images
     disabled: false
+
+  # --- Moteurs par défaut SearXNG qui ne répondent plus ---
+  # Non déclarés plus haut : ils viennent de use_default_settings, on les
+  # neutralise ici pour ne pas attendre leur timeout à chaque requête.
+  - name: brave.news
+    engine: brave
+    disabled: true
+
+  - name: brave.images
+    engine: brave
+    disabled: true
+
+  - name: brave.videos
+    engine: brave
+    disabled: true
+
+  - name: google videos
+    engine: google_videos
+    disabled: true
+
+  - name: startpage news
+    engine: startpage
+    disabled: true
+
+  - name: startpage images
+    engine: startpage
+    disabled: true
+
+  - name: duckduckgo images
+    engine: duckduckgo_extra
+    disabled: true
+
+  - name: reuters
+    engine: reuters
+    disabled: true
+
+  - name: tootfinder
+    engine: tootfinder
+    disabled: true
+
+  - name: vimeo
+    engine: vimeo
+    disabled: true
+
+  - name: pexels
+    engine: pexels
+    disabled: true
 
