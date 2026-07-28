@@ -4,6 +4,8 @@ import logging
 import os
 import sys
 
+from urllib.parse import quote
+
 import aiohttp
 import openai
 import trafilatura
@@ -30,7 +32,11 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 DEFAULT_N_RESULTS = int(os.environ.get("DEFAULT_N_RESULTS", "4"))
 FETCH_TOP_N = int(os.environ.get("FETCH_TOP_N", "4"))
-FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "8"))
+# 3s plutôt que 8 : le fetch est parallèle, son coût est celui de la page la
+# plus lente. Mesuré sur un lot de 8 pages, sept répondent en moins de 2s et
+# une traîne — la borne basse coupe cette traînarde, dont on garde l'extrait du
+# moteur, au lieu de faire attendre tout le monde.
+FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "3"))
 FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "3000"))
 ANYSEARCH_API_KEY = os.environ.get("ANYSEARCH_API_KEY", "")
 ANYSEARCH_URL = "https://api.anysearch.com/v1/search"
@@ -44,6 +50,14 @@ DDGS_TEXT_BACKENDS = os.environ.get("DDGS_TEXT_BACKENDS", "bing,yandex,yahoo").s
 DDGS_NEWS_BACKENDS = os.environ.get("DDGS_NEWS_BACKENDS", "bing,duckduckgo").split(",")
 DDGS_TIMEOUT = int(os.environ.get("DDGS_TIMEOUT", "20"))
 DDGS_REGION = os.environ.get("DDGS_REGION", "fr-fr")
+
+# API MediaWiki plutôt que le backend wikipedia de ddgs, qui fait du rapprochement
+# de titre et non de la recherche : il répond "Guerre en Irak" à "guerre en Iran"
+# et ne trouve rien pour une question formulée à l'oral. L'API officielle est
+# gratuite, sans clé, et répond en 0,6 s.
+WIKIPEDIA_API = os.environ.get("WIKIPEDIA_API", "https://fr.wikipedia.org/w/api.php")
+WIKIPEDIA_N = int(os.environ.get("WIKIPEDIA_N", "3"))
+WIKIPEDIA_UA = "caronboulme-search-agent/1.0 (https://caronboulme.fr)"
 
 AGENT_NAME = "search"
 _subscribed_sessions: set[str] = set()
@@ -89,6 +103,12 @@ async def create_nexus_client() -> NexusClient:
 # LLM tools
 # ---------------------------------------------------------------------------
 
+# La contrainte de longueur de chaque prompt est ce qui borne le temps de
+# réponse : le coût d'un appel tient à ce que le modèle génère, pas à ce qu'il
+# lit (diviser le contexte par 3,7 ne gagne que 0,7s, alors que passer de 5 à
+# 3 phrases en gagne 1,5). Un prompt qui demande d'être « dense » ou
+# « exhaustif » produit l'inverse de l'effet recherché : le modèle part en
+# listes et double son temps.
 DETAIL_SYSTEM_PROMPTS = {
     1: (
         "Réponds à la question en UNE seule phrase directe et naturelle, à l'oral. "
@@ -98,14 +118,34 @@ DETAIL_SYSTEM_PROMPTS = {
     2: (
         "Rédige un paragraphe clair et factuel répondant à la question, "
         "basé uniquement sur les résultats de recherche fournis. "
-        "3 à 5 phrases. Français, ton oral. Pas de liste ni de tirets."
+        "2 à 3 phrases maximum. Français, ton oral. Pas de liste ni de tirets."
     ),
     3: (
-        "Rédige une réponse détaillée avec tous les faits pertinents des résultats de recherche. "
+        "Rédige une réponse détaillée avec les faits pertinents des résultats de recherche, "
+        "en 5 phrases maximum. "
         "Cite les sources naturellement quand c'est pertinent (ex: 'selon Le Monde...', 'd'après Wikipedia...'). "
         "Français, ton oral. Pas de liste ni de tirets."
     ),
 }
+
+# Borne haute par niveau, pour qu'un modèle qui ignore la consigne de longueur
+# ne fasse pas exploser le temps de réponse. Sans elle, le niveau 3 atteignait
+# le plafond de 600 tokens et mettait 19s.
+MAX_TOKENS_BY_LEVEL = {1: 120, 2: 250, 3: 450}
+
+# Ajouté au prompt quand les deux volets portent du contenu. Les résultats
+# arrivent au LLM sous deux intitulés (FOND et ACTUALITÉ RÉCENTE) : sans cette
+# consigne il les mélange et noie la chronologie, alors que l'intérêt de
+# chercher les deux est justement de distinguer ce qui est établi de ce qui
+# vient de bouger.
+STRUCTURE_HINT = (
+    " Les résultats sont groupés en deux ensembles. Commence par situer le "
+    "sujet à partir du FOND, puis enchaîne sur ce qui a bougé récemment à "
+    "partir de l'ACTUALITÉ RÉCENTE, en le signalant naturellement à l'oral "
+    "('ces derniers jours...', 'plus récemment...'). Si l'un des deux "
+    "ensembles n'apporte rien sur la question, ne le mentionne pas et "
+    "réponds avec l'autre."
+)
 
 REPORT_TOOL = [{
     "type": "function",
@@ -130,14 +170,39 @@ REPORT_TOOL = [{
 # LLM calls
 # ---------------------------------------------------------------------------
 
-def _synthesize_sync(query: str, results: list[dict], detail_level: int) -> str:
-    system_prompt = DETAIL_SYSTEM_PROMPTS.get(detail_level, DETAIL_SYSTEM_PROMPTS[2])
-
-    results_text = "\n\n".join(
-        f"[{i+1}] {r.get('title', '')}\nSource: {r.get('url', '')}\n{r.get('content', '')}"
-        for i, r in enumerate(results[:15])
+def _format_results(results: list[dict], start: int = 1) -> str:
+    return "\n\n".join(
+        f"[{start + i}] {r.get('title', '')}\nSource: {r.get('url', '')}\n{r.get('content', '')}"
+        for i, r in enumerate(results)
         if r.get("content")
     )
+
+
+def _synthesize_sync(query: str, background: list[dict], recent: list[dict],
+                     detail_level: int) -> str:
+    """Synthétise les deux volets en une seule réponse orale.
+
+    Un seul appel LLM plutôt qu'un par volet : le modèle a besoin de voir le
+    fond pour savoir ce qui, dans l'actualité, mérite d'être signalé comme
+    nouveau.
+    """
+    system_prompt = DETAIL_SYSTEM_PROMPTS.get(detail_level, DETAIL_SYSTEM_PROMPTS[2])
+
+    bg_text = _format_results(background[:10])
+    rc_text = _format_results(recent[:8], start=len(background[:10]) + 1)
+
+    # detail_level 1 attend une phrase unique : la structurer en deux temps
+    # produirait exactement ce que ce niveau cherche à éviter.
+    if bg_text and rc_text and detail_level > 1:
+        system_prompt += STRUCTURE_HINT
+
+    sections = []
+    if bg_text:
+        sections.append(f"FOND (encyclopédie et sources de référence):\n{bg_text}")
+    if rc_text:
+        sections.append(f"ACTUALITÉ RÉCENTE (presse):\n{rc_text}")
+    results_text = "\n\n".join(sections)
+
     user_content = f"Question: {query}\n\nRésultats de recherche:\n{results_text}"
 
     try:
@@ -150,7 +215,7 @@ def _synthesize_sync(query: str, results: list[dict], detail_level: int) -> str:
             ],
             tools=REPORT_TOOL,
             tool_choice="required",
-            max_tokens=600,
+            max_tokens=MAX_TOKENS_BY_LEVEL.get(detail_level, 250),
         )
         msg = resp.choices[0].message
         report = ""
@@ -235,23 +300,24 @@ async def _fetch_page_content(session: aiohttp.ClientSession, url: str) -> str |
 
 
 async def _enrich_results(results: list[dict]) -> list[dict]:
-    """Fetch full page content for top N results, fallback to SearXNG snippet."""
-    to_fetch = [r for r in results[:FETCH_TOP_N] if r.get("url")]
+    """Récupère le contenu réel des N premières pages, sinon garde l'extrait.
+
+    Les résultats marqués no_fetch (extraits Wikipédia) sont laissés tels
+    quels : leur contenu est déjà le résumé voulu, et fetcher la page
+    ramènerait l'article entier avec ses annexes.
+    """
+    to_fetch = [r for r in results[:FETCH_TOP_N] if r.get("url") and not r.get("no_fetch")]
     async with aiohttp.ClientSession() as session:
         fetched = await asyncio.gather(*[_fetch_page_content(session, r["url"]) for r in to_fetch])
+    by_url = dict(zip((r["url"] for r in to_fetch), fetched))
 
     enriched = []
-    fetch_idx = 0
-    for i, result in enumerate(results):
+    for result in results:
         r = dict(result)
-        if i < FETCH_TOP_N:
-            full = fetched[fetch_idx]
-            fetch_idx += 1
-            if full:
-                r["content"] = full
-                logger.info(f"Fetch OK: {r['url'][:60]} ({len(full)} chars)")
-            else:
-                logger.debug(f"Fetch échoué, fallback snippet: {r.get('url', '')[:60]}")
+        full = by_url.get(r.get("url"))
+        if full:
+            r["content"] = full
+            logger.info(f"Fetch OK: {r['url'][:60]} ({len(full)} chars)")
         enriched.append(r)
     return enriched
 
@@ -326,6 +392,64 @@ async def _ddgs_search(query: str, n: int, recent: bool = False) -> list[dict]:
     return await loop.run_in_executor(None, _ddgs_search_sync, query, n, recent)
 
 
+# ---------------------------------------------------------------------------
+# Wikipédia — volet encyclopédique du fond
+# ---------------------------------------------------------------------------
+
+async def _wikipedia_search(query: str, n: int = WIKIPEDIA_N) -> list[dict]:
+    """Cherche des articles Wikipédia et récupère leur introduction.
+
+    Deux appels à l'API MediaWiki : list=search pour trouver les articles,
+    prop=extracts pour leur résumé. L'introduction suffit et évite le hors-sujet
+    des sections annexes ; ces résultats n'ont donc pas besoin d'être enrichis
+    par un fetch de page.
+    """
+    try:
+        async with aiohttp.ClientSession(headers={"User-Agent": WIKIPEDIA_UA}) as session:
+            async with session.get(
+                WIKIPEDIA_API,
+                params={
+                    "action": "query", "list": "search", "srsearch": query,
+                    "srlimit": n, "format": "json",
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+                hits = (await resp.json()).get("query", {}).get("search", [])
+
+            if not hits:
+                logger.info(f"Wikipédia '{query[:50]}': aucun article")
+                return []
+
+            async with session.get(
+                WIKIPEDIA_API,
+                params={
+                    "action": "query", "prop": "extracts", "explaintext": 1,
+                    "exintro": 1, "titles": "|".join(h["title"] for h in hits),
+                    "format": "json",
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                resp.raise_for_status()
+                pages = (await resp.json()).get("query", {}).get("pages", {})
+
+            results = [
+                {
+                    "title": p.get("title", ""),
+                    "url": f"https://fr.wikipedia.org/wiki/{quote(p.get('title', '').replace(' ', '_'))}",
+                    "content": (p.get("extract") or "")[:FETCH_MAX_CHARS],
+                    "no_fetch": True,  # l'extrait fait foi, inutile d'aller chercher la page
+                }
+                for p in pages.values()
+                if p.get("extract")
+            ]
+            logger.info(f"Wikipédia '{query[:50]}': {len(results)} articles")
+            return results
+    except Exception as e:
+        logger.error(f"Wikipédia échoué: {e}")
+        return []
+
+
 async def _anysearch_search(query: str, n: int) -> list[dict]:
     if not ANYSEARCH_API_KEY:
         return []
@@ -354,21 +478,43 @@ async def _anysearch_search(query: str, n: int) -> list[dict]:
         return []
 
 
-async def _search_with_fallback(query: str, n: int, recent: bool = False,
-                                 log_prefix: str = "") -> list[dict]:
-    """Cherche via ddgs, retombe sur AnySearch si aucun backend ne répond.
+async def _search_two_sided(query: str, n: int, log_prefix: str = "") -> tuple[list[dict], list[dict]]:
+    """Cherche le fond et l'actualité en parallèle, renvoie (fond, récent).
 
-    Les moteurs ne renvoient qu'un extrait par résultat : _enrich_results va
-    chercher le contenu réel des pages avant que le LLM ne synthétise.
+    Trois sources lancées ensemble : Wikipédia et le web pour le fond, la
+    presse pour l'actualité. Le coût en latence est celui de la plus lente,
+    pas de leur somme.
+
+    AnySearch ne prend le relais que si le web ET la presse sont muets :
+    Wikipédia seul ne suffit pas à considérer la recherche réussie, il répond
+    presque toujours quelque chose, fût-ce à côté.
     """
-    results = await _ddgs_search(query, n, recent)
-    if not results:
-        logger.info(f"{log_prefix} ddgs muet — fallback AnySearch")
-        results = await _anysearch_search(query, n)
+    wiki, web, press = await asyncio.gather(
+        _wikipedia_search(query),
+        _ddgs_search(query, n, recent=False),
+        _ddgs_search(query, n, recent=True),
+    )
 
-    if not results:
-        return []
-    return _dedup_results(await _enrich_results(results))
+    if not web and not press:
+        logger.info(f"{log_prefix} ddgs muet des deux côtés — fallback AnySearch")
+        web = await _anysearch_search(query, n)
+
+    background_raw = _dedup_results(wiki + web)
+    recent_raw = _dedup_results(press)
+
+    background, recent_res = await asyncio.gather(
+        _enrich_results(background_raw) if background_raw else _noop_list(),
+        _enrich_results(recent_raw) if recent_raw else _noop_list(),
+    )
+    logger.info(
+        f"{log_prefix} fond: {len(background)} sources "
+        f"({len(wiki)} wikipédia) — actualité: {len(recent_res)} sources"
+    )
+    return background, recent_res
+
+
+async def _noop_list() -> list[dict]:
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -413,28 +559,32 @@ async def on_user_connected(topic: str, payload):
                     "description": (
                         "Recherche sur internet — pour toute question factuelle précise "
                         "(sujet, personne, lieu, définition, valeur boursière, événement). "
-                        "Mettre 'recent' à true quand la question porte sur l'actualité "
-                        "et attend ce qui s'est passé récemment ('quoi de neuf sur...', "
-                        "'dernières annonces', 'où en est...') : la recherche interroge "
-                        "alors la presse et trie par date. Le laisser à false pour une "
-                        "question intemporelle, sinon les sources de référence "
-                        "(encyclopédies, sites officiels) sont écartées."
+                        "Poser la question telle quelle : la recherche interroge à la fois "
+                        "l'encyclopédie et le web pour le fond du sujet, et la presse pour "
+                        "ce qui a bougé récemment, puis rend une réponse qui enchaîne les "
+                        "deux. Rien d'autre à préciser."
                     ),
                     "access": "write",
                     "response_topic": result_topic,
                     "format": {
                         "query": "string",
-                        "recent": False,
                         "n_results": 8,
                         "detail_level": 2,
                     },
                 },
                 {
                     "topic": result_topic,
-                    "description": "Résultat de la recherche internet. Utiliser le champ 'report' pour répondre.",
+                    "description": (
+                        "Résultat de la recherche internet. Utiliser le champ 'report' pour "
+                        "répondre : il couvre déjà le fond du sujet puis l'actualité récente. "
+                        "'background' et 'recent' donnent les sources brutes de chaque volet, "
+                        "pour les agents qui veulent les traiter séparément."
+                    ),
                     "access": "read",
                     "format": {
                         "report": "string",
+                        "background": "string",
+                        "recent": "string",
                         "sources": [{"title": "string", "url": "string"}],
                     },
                 },
@@ -474,29 +624,35 @@ async def on_user_connected(topic: str, payload):
             detail_level = int(p.get("detail_level", 2))
             if detail_level not in (1, 2, 3):
                 detail_level = 2
-            recent = bool(p.get("recent", False))
-            logger.info(f"[{username}] Recherche: '{query}' recent={recent} n={n_results} level={detail_level}")
+            logger.info(f"[{username}] Recherche: '{query}' n={n_results} level={detail_level}")
 
             loop = asyncio.get_event_loop()
 
-            # 1. Search (ddgs, fallback AnySearch)
-            enriched_results = await _search_with_fallback(
-                query, n_results, recent, log_prefix=f"[{username}/{session_id}]"
+            # 1. Fond (wikipédia + web) et actualité (presse), en parallèle
+            background, recent_res = await _search_two_sided(
+                query, n_results, log_prefix=f"[{username}/{session_id}]"
             )
 
-            if not enriched_results:
+            if not background and not recent_res:
                 await nexus.publish(result_topic, {
                     "report": "Je n'ai pas trouvé de résultats pour cette recherche.",
                     "sources": [],
                 })
                 return
 
-            # 2. Synthesize from enriched content
-            report = await loop.run_in_executor(None, _synthesize_sync, query, enriched_results, detail_level)
+            # 2. Synthèse des deux volets en une seule réponse orale
+            report = await loop.run_in_executor(
+                None, _synthesize_sync, query, background, recent_res, detail_level
+            )
 
-            sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in enriched_results[:5]]
+            sources = [
+                {"title": r.get("title", ""), "url": r.get("url", "")}
+                for r in (background[:3] + recent_res[:3])
+            ]
             await nexus.publish(result_topic, {
                 "report": report,
+                "background": _format_results(background[:10]),
+                "recent": _format_results(recent_res[:8]),
                 "sources": sources,
             })
             logger.info(f"[{username}/{session_id}] Résultat publié sur {result_topic}")
@@ -539,23 +695,34 @@ async def main():
             return
         try:
             n_results    = int(payload.get("n_results", DEFAULT_N_RESULTS))
-            detail_level = int(payload.get("detail_level", 2))
-            if detail_level not in (1, 2, 3):
-                detail_level = 2
-            recent = bool(payload.get("recent", False))
-            logger.info(f"[service] Recherche: {query!r} recent={recent}")
+            logger.info(f"[service] Recherche: {query!r}")
 
-            enriched = await _search_with_fallback(query, n_results, recent, log_prefix="[service]")
-            if not enriched:
+            background, recent_res = await _search_two_sided(query, n_results, log_prefix="[service]")
+            if not background and not recent_res:
                 await nexus.publish(reply_to, {"report": "", "sources": []})
                 return
-            parts = [
-                f"[{r.get('title', '')}]\nSource: {r.get('url', '')}\n{(r.get('content') or '')[:1500]}"
-                for r in enriched if r.get("content") or r.get("title")
+
+            # Pas de synthèse LLM ici : les agents appelants (bulletin news)
+            # refont leur propre passe sur le contenu brut, une synthèse
+            # intermédiaire ne ferait que leur retirer de la matière.
+            bg = _format_results(background[:10])
+            rc = _format_results(recent_res[:8], start=len(background[:10]) + 1)
+            report = "\n\n---\n\n".join(
+                s for s in (
+                    f"FOND\n{bg}" if bg else "",
+                    f"ACTUALITÉ RÉCENTE\n{rc}" if rc else "",
+                ) if s
+            )
+            sources = [
+                {"title": r.get("title", ""), "url": r.get("url", "")}
+                for r in (background[:3] + recent_res[:3])
             ]
-            report = "\n\n---\n\n".join(parts)
-            sources = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in enriched[:5]]
-            await nexus.publish(reply_to, {"report": report, "sources": sources})
+            await nexus.publish(reply_to, {
+                "report": report,
+                "background": bg,
+                "recent": rc,
+                "sources": sources,
+            })
             logger.info(f"[service] Résultat publié ({len(report)} chars)")
         except Exception as e:
             logger.error(f"[service] Erreur recherche {query!r}: {e}")
