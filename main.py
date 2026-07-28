@@ -160,10 +160,28 @@ def _synthesize_sync(query: str, results: list[dict], detail_level: int) -> str:
             tool_choice="required",
             max_tokens=600,
         )
-        tool_calls = resp.choices[0].message.tool_calls
-        if not tool_calls:
-            return results_text[:500]
-        report = json.loads(tool_calls[0].function.arguments).get("report", "")
+        msg = resp.choices[0].message
+        report = ""
+
+        if msg.tool_calls:
+            try:
+                report = json.loads(msg.tool_calls[0].function.arguments).get("report", "")
+            except (json.JSONDecodeError, AttributeError, IndexError) as e:
+                logger.warning(f"Tool call illisible: {e}")
+
+        if not report and msg.content:
+            # vLLM annonce finish_reason=tool_calls mais ne parse aucun tool call
+            # avec ce modèle : la synthèse arrive telle quelle dans content. Sans
+            # cette reprise, on la jetait pour renvoyer results_text[:500], soit un
+            # extrait brut tronqué après plusieurs secondes d'attente.
+            content = msg.content.strip()
+            if content.startswith("{"):
+                try:
+                    content = json.loads(content).get("report", content)
+                except json.JSONDecodeError:
+                    pass
+            report = content
+
         logger.info(f"Synthèse (level={detail_level}): {report[:100]!r}...")
         return report or results_text[:500]
     except Exception as e:
@@ -427,9 +445,16 @@ async def on_user_connected(topic: str, payload):
                 {
                     "topic": request_topic,
                     "description": (
-                        "Recherche sur internet via SearXNG — pour toute question factuelle "
-                        "précise (sujet, personne, lieu, définition, valeur boursière, événement). "
-                        "Catégories: general, news, science, it, social+media, map, music, videos, images."
+                        "Recherche sur internet — pour toute question factuelle précise "
+                        "(sujet, personne, lieu, définition, valeur boursière, événement). "
+                        "Le champ 'categories' choisit les sources interrogées, la même "
+                        "question ne renvoie donc pas la même chose selon sa valeur : "
+                        "general = web grand public (défaut) ; news = presse et actualité "
+                        "récente ; science = publications scientifiques (pubmed, arxiv) ; "
+                        "it = code et technique (github, stackoverflow, npm) ; "
+                        "social+media = mastodon et lemmy ; map = lieux et adresses ; "
+                        "music = titres et artistes ; videos = youtube et dailymotion ; "
+                        "images = banques d'images."
                     ),
                     "access": "write",
                     "response_topic": result_topic,
