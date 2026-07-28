@@ -12,7 +12,6 @@ services:
       LLM_BASE_URL: ${LLM_BASE_URL}
       LLM_MODEL: ${LLM_MODEL:-qwen3-vl-8b-instruct}
       LLAMACPP_API_KEY: ${LLAMACPP_API_KEY}
-      SEARXNG_URL: http://searxng:8080
       DEFAULT_N_RESULTS: ${DEFAULT_N_RESULTS:-8}
       FETCH_TOP_N: ${FETCH_TOP_N:-8}
       CONTEXT_TTL_SECONDS: ${CONTEXT_TTL_SECONDS:-7200}
@@ -22,31 +21,7 @@ services:
       DDGS_REGION: ${DDGS_REGION:-fr-fr}
     networks:
       - ansible
-    depends_on:
-      - searxng
     restart: unless-stopped
-
-  searxng:
-    image: searxng/searxng:latest
-    container_name: searxng
-    volumes:
-      - ./searxng:/etc/searxng:rw
-    environment:
-      - SEARXNG_BASE_URL=http://searxng:8080
-    networks:
-      - ansible
-    restart: unless-stopped
-    cap_drop:
-      - ALL
-    cap_add:
-      - CHOWN
-      - SETGID
-      - SETUID
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 networks:
   ansible:

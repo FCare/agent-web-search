@@ -28,7 +28,6 @@ AUTHENTIK_CLIENT_SECRET = os.environ["AUTHENTIK_CLIENT_SECRET"]
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://thebrain.caronboulme.fr/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
 LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
-SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://searxng:8080")
 DEFAULT_N_RESULTS = int(os.environ.get("DEFAULT_N_RESULTS", "4"))
 FETCH_TOP_N = int(os.environ.get("FETCH_TOP_N", "4"))
 FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "8"))
@@ -45,13 +44,6 @@ DDGS_TEXT_BACKENDS = os.environ.get("DDGS_TEXT_BACKENDS", "bing,yandex,yahoo").s
 DDGS_NEWS_BACKENDS = os.environ.get("DDGS_NEWS_BACKENDS", "bing,duckduckgo").split(",")
 DDGS_TIMEOUT = int(os.environ.get("DDGS_TIMEOUT", "20"))
 DDGS_REGION = os.environ.get("DDGS_REGION", "fr-fr")
-
-# Catégories servies par ddgs plutôt que par SearXNG : ce sont celles où les
-# moteurs web généralistes de SearXNG se font bloquer (CAPTCHA/429). Les autres
-# (science, it, music, videos, images, social media, map) restent sur SearXNG,
-# qui y agrège des sources spécialisées que ddgs n'a pas (pubmed, arxiv, github,
-# stackoverflow, mastodon...).
-DDGS_CATEGORIES = {"general", "news"}
 
 AGENT_NAME = "search"
 _subscribed_sessions: set[str] = set()
@@ -190,7 +182,7 @@ def _synthesize_sync(query: str, results: list[dict], detail_level: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# SearXNG
+# Filtrage des résultats
 # ---------------------------------------------------------------------------
 
 # Sites de dictionnaire/définition/mots-fléchés : toujours assez longs pour
@@ -206,31 +198,6 @@ _NOISE_DOMAINS = (
 
 def _is_reference_noise(url: str) -> bool:
     return any(d in url for d in _NOISE_DOMAINS)
-
-
-async def _search(query: str, categories: str, n: int) -> list[dict]:
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{SEARXNG_URL}/search",
-                params={
-                    "q": query,
-                    "format": "json",
-                    "categories": categories,
-                    "language": "fr-FR",
-                    "pageno": 1,
-                },
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                all_results = [r for r in data.get("results", []) if not _is_reference_noise(r.get("url", ""))]
-                results = all_results[:n]
-                logger.info(f"SearXNG '{query}' ({categories}): {len(results)} résultats")
-                return results
-    except Exception as e:
-        logger.error(f"SearXNG échoué: {e}")
-        return []
 
 
 _FETCH_HEADERS = {
@@ -305,12 +272,17 @@ def _dedup_results(results: list[dict]) -> list[dict]:
 # SearXNG se fait renvoyer un CAPTCHA par les moteurs web généralistes.
 # ---------------------------------------------------------------------------
 
-def _ddgs_search_sync(query: str, categories: str, n: int) -> list[dict]:
+def _ddgs_search_sync(query: str, n: int, recent: bool) -> list[dict]:
     """Interroge les backends ddgs dans l'ordre, s'arrête au premier qui répond.
+
+    recent bascule sur l'API news de ddgs, dont les résultats sont datés et
+    triés par fraîcheur. Le filtre timelimit de l'API text ne remplace pas ce
+    basculement : yandex l'ignore et bing continue de remonter des pages
+    intemporelles (Wikipédia, TikTok) malgré lui.
 
     ddgs est synchrone et bloquant : à appeler dans un executor.
     """
-    is_news = categories == "news"
+    is_news = recent
     backends = DDGS_NEWS_BACKENDS if is_news else DDGS_TEXT_BACKENDS
 
     for backend in backends:
@@ -340,17 +312,18 @@ def _ddgs_search_sync(query: str, categories: str, n: int) -> list[dict]:
             for r in raw
             if not _is_reference_noise(r.get("href") or r.get("url", ""))
         ]
+        mode = "news" if is_news else "text"
         if results:
-            logger.info(f"ddgs[{backend}] '{query[:50]}' ({categories}): {len(results)} résultats")
+            logger.info(f"ddgs[{backend}/{mode}] '{query[:50]}': {len(results)} résultats")
             return results[:n]
 
-    logger.warning(f"ddgs: aucun backend n'a répondu pour '{query[:50]}' ({categories})")
+    logger.warning(f"ddgs: aucun backend n'a répondu pour '{query[:50]}' (recent={recent})")
     return []
 
 
-async def _ddgs_search(query: str, categories: str, n: int) -> list[dict]:
+async def _ddgs_search(query: str, n: int, recent: bool = False) -> list[dict]:
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _ddgs_search_sync, query, categories, n)
+    return await loop.run_in_executor(None, _ddgs_search_sync, query, n, recent)
 
 
 async def _anysearch_search(query: str, n: int) -> list[dict]:
@@ -381,24 +354,17 @@ async def _anysearch_search(query: str, n: int) -> list[dict]:
         return []
 
 
-async def _search_with_fallback(query: str, categories: str, n: int, log_prefix: str = "") -> list[dict]:
-    """Route la requête vers le moteur adapté à la catégorie, puis enrichit.
+async def _search_with_fallback(query: str, n: int, recent: bool = False,
+                                 log_prefix: str = "") -> list[dict]:
+    """Cherche via ddgs, retombe sur AnySearch si aucun backend ne répond.
 
-    general et news vont chez ddgs, qui passe là où les moteurs web de SearXNG
-    se font bloquer ; AnySearch prend le relais si aucun backend ddgs ne répond.
-    Les autres catégories vont chez SearXNG, seul à agréger les sources
-    spécialisées correspondantes (pubmed, arxiv, github, mastodon...).
-
-    Dans les deux cas les résultats ne portent qu'un extrait : _enrich_results
-    va chercher le contenu réel des pages.
+    Les moteurs ne renvoient qu'un extrait par résultat : _enrich_results va
+    chercher le contenu réel des pages avant que le LLM ne synthétise.
     """
-    if categories in DDGS_CATEGORIES:
-        results = await _ddgs_search(query, categories, n)
-        if not results:
-            logger.info(f"{log_prefix} ddgs muet — fallback AnySearch")
-            results = await _anysearch_search(query, n)
-    else:
-        results = await _search(query, categories, n)
+    results = await _ddgs_search(query, n, recent)
+    if not results:
+        logger.info(f"{log_prefix} ddgs muet — fallback AnySearch")
+        results = await _anysearch_search(query, n)
 
     if not results:
         return []
@@ -447,20 +413,18 @@ async def on_user_connected(topic: str, payload):
                     "description": (
                         "Recherche sur internet — pour toute question factuelle précise "
                         "(sujet, personne, lieu, définition, valeur boursière, événement). "
-                        "Le champ 'categories' choisit les sources interrogées, la même "
-                        "question ne renvoie donc pas la même chose selon sa valeur : "
-                        "general = web grand public (défaut) ; news = presse et actualité "
-                        "récente ; science = publications scientifiques (pubmed, arxiv) ; "
-                        "it = code et technique (github, stackoverflow, npm) ; "
-                        "social+media = mastodon et lemmy ; map = lieux et adresses ; "
-                        "music = titres et artistes ; videos = youtube et dailymotion ; "
-                        "images = banques d'images."
+                        "Mettre 'recent' à true quand la question porte sur l'actualité "
+                        "et attend ce qui s'est passé récemment ('quoi de neuf sur...', "
+                        "'dernières annonces', 'où en est...') : la recherche interroge "
+                        "alors la presse et trie par date. Le laisser à false pour une "
+                        "question intemporelle, sinon les sources de référence "
+                        "(encyclopédies, sites officiels) sont écartées."
                     ),
                     "access": "write",
                     "response_topic": result_topic,
                     "format": {
                         "query": "string",
-                        "categories": "general",
+                        "recent": False,
                         "n_results": 8,
                         "detail_level": 2,
                     },
@@ -506,18 +470,18 @@ async def on_user_connected(topic: str, payload):
             return
 
         try:
-            categories = p.get("categories", "general")
             n_results = int(p.get("n_results", DEFAULT_N_RESULTS))
             detail_level = int(p.get("detail_level", 2))
             if detail_level not in (1, 2, 3):
                 detail_level = 2
-            logger.info(f"[{username}] Recherche: '{query}' categories={categories} n={n_results} level={detail_level}")
+            recent = bool(p.get("recent", False))
+            logger.info(f"[{username}] Recherche: '{query}' recent={recent} n={n_results} level={detail_level}")
 
             loop = asyncio.get_event_loop()
 
-            # 1. Search (ddgs ou SearXNG selon la catégorie, fallback AnySearch)
+            # 1. Search (ddgs, fallback AnySearch)
             enriched_results = await _search_with_fallback(
-                query, categories, n_results, log_prefix=f"[{username}/{session_id}]"
+                query, n_results, recent, log_prefix=f"[{username}/{session_id}]"
             )
 
             if not enriched_results:
@@ -574,14 +538,14 @@ async def main():
             await nexus.publish(reply_to, {"report": "Erreur: la requête de recherche ne contenait pas de terme à chercher.", "sources": []})
             return
         try:
-            categories   = payload.get("categories", "general")
             n_results    = int(payload.get("n_results", DEFAULT_N_RESULTS))
             detail_level = int(payload.get("detail_level", 2))
             if detail_level not in (1, 2, 3):
                 detail_level = 2
-            logger.info(f"[service] Recherche: {query!r} categories={categories}")
+            recent = bool(payload.get("recent", False))
+            logger.info(f"[service] Recherche: {query!r} recent={recent}")
 
-            enriched = await _search_with_fallback(query, categories, n_results, log_prefix="[service]")
+            enriched = await _search_with_fallback(query, n_results, recent, log_prefix="[service]")
             if not enriched:
                 await nexus.publish(reply_to, {"report": "", "sources": []})
                 return
@@ -600,7 +564,10 @@ async def main():
     nexus.subscribe("common/user_connected", on_user_connected)
     nexus.subscribe(SERVICE_REQUEST_TOPIC, on_service_search_request)
     nexus.start_listening()
-    logger.info(f"Search service démarré — SearXNG: {SEARXNG_URL}")
+    logger.info(
+        f"Search service démarré — ddgs text={','.join(DDGS_TEXT_BACKENDS)} "
+        f"news={','.join(DDGS_NEWS_BACKENDS)}, fallback AnySearch"
+    )
     await asyncio.Event().wait()
 
 
