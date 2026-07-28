@@ -7,7 +7,6 @@ import sys
 from urllib.parse import quote
 
 import aiohttp
-import openai
 import trafilatura
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
@@ -27,9 +26,6 @@ MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 AUTHENTIK_URL = os.environ.get("AUTHENTIK_URL", "https://sso.caronboulme.fr")
 AUTHENTIK_CLIENT_ID = os.environ["AUTHENTIK_CLIENT_ID"]
 AUTHENTIK_CLIENT_SECRET = os.environ["AUTHENTIK_CLIENT_SECRET"]
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://thebrain.caronboulme.fr/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3-vl-8b-instruct")
-LLAMACPP_API_KEY = os.environ["LLAMACPP_API_KEY"]
 DEFAULT_N_RESULTS = int(os.environ.get("DEFAULT_N_RESULTS", "4"))
 FETCH_TOP_N = int(os.environ.get("FETCH_TOP_N", "4"))
 # 3s plutôt que 8 : le fetch est parallèle, son coût est celui de la page la
@@ -38,6 +34,13 @@ FETCH_TOP_N = int(os.environ.get("FETCH_TOP_N", "4"))
 # moteur, au lieu de faire attendre tout le monde.
 FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "3"))
 FETCH_MAX_CHARS = int(os.environ.get("FETCH_MAX_CHARS", "3000"))
+# Longueur retenue par source dans la réponse, et nombre de sources par volet.
+# L'agent ne rédige pas : il rend la matière brute et c'est l'assistant qui
+# formule. Ces bornes tiennent l'ensemble autour de 9 000 caractères, le point
+# où son tour de parole reste rapide.
+RESULT_MAX_CHARS = int(os.environ.get("RESULT_MAX_CHARS", "800"))
+BACKGROUND_N = int(os.environ.get("BACKGROUND_N", "6"))
+RECENT_N = int(os.environ.get("RECENT_N", "5"))
 ANYSEARCH_API_KEY = os.environ.get("ANYSEARCH_API_KEY", "")
 ANYSEARCH_URL = "https://api.anysearch.com/v1/search"
 
@@ -98,153 +101,6 @@ async def create_nexus_client() -> NexusClient:
     )
     logger.info(f"NexusClient créé avec username: {nexus._username}")
     return nexus
-
-# ---------------------------------------------------------------------------
-# LLM tools
-# ---------------------------------------------------------------------------
-
-# La contrainte de longueur de chaque prompt est ce qui borne le temps de
-# réponse : le coût d'un appel tient à ce que le modèle génère, pas à ce qu'il
-# lit (diviser le contexte par 3,7 ne gagne que 0,7s, alors que passer de 5 à
-# 3 phrases en gagne 1,5). Un prompt qui demande d'être « dense » ou
-# « exhaustif » produit l'inverse de l'effet recherché : le modèle part en
-# listes et double son temps.
-DETAIL_SYSTEM_PROMPTS = {
-    1: (
-        "Réponds à la question en UNE seule phrase directe et naturelle, à l'oral. "
-        "Utilise uniquement les informations des résultats de recherche fournis. "
-        "Pas de citation de sources."
-    ),
-    2: (
-        "Rédige un paragraphe clair et factuel répondant à la question, "
-        "basé uniquement sur les résultats de recherche fournis. "
-        "2 à 3 phrases maximum. Français, ton oral. Pas de liste ni de tirets."
-    ),
-    3: (
-        "Rédige une réponse détaillée avec les faits pertinents des résultats de recherche, "
-        "en 5 phrases maximum. "
-        "Cite les sources naturellement quand c'est pertinent (ex: 'selon Le Monde...', 'd'après Wikipedia...'). "
-        "Français, ton oral. Pas de liste ni de tirets."
-    ),
-}
-
-# Borne haute par niveau, pour qu'un modèle qui ignore la consigne de longueur
-# ne fasse pas exploser le temps de réponse. Sans elle, le niveau 3 atteignait
-# le plafond de 600 tokens et mettait 19s.
-MAX_TOKENS_BY_LEVEL = {1: 120, 2: 250, 3: 450}
-
-# Ajouté au prompt quand les deux volets portent du contenu. Les résultats
-# arrivent au LLM sous deux intitulés (FOND et ACTUALITÉ RÉCENTE) : sans cette
-# consigne il les mélange et noie la chronologie, alors que l'intérêt de
-# chercher les deux est justement de distinguer ce qui est établi de ce qui
-# vient de bouger.
-STRUCTURE_HINT = (
-    " Les résultats sont groupés en deux ensembles. Commence par situer le "
-    "sujet à partir du FOND, puis enchaîne sur ce qui a bougé récemment à "
-    "partir de l'ACTUALITÉ RÉCENTE, en le signalant naturellement à l'oral "
-    "('ces derniers jours...', 'plus récemment...'). Si l'un des deux "
-    "ensembles n'apporte rien sur la question, ne le mentionne pas et "
-    "réponds avec l'autre."
-)
-
-REPORT_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "report_search",
-        "description": "Report the search answer as natural spoken French.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "report": {
-                    "type": "string",
-                    "description": "The answer in French, natural spoken language.",
-                }
-            },
-            "required": ["report"],
-        },
-    },
-}]
-
-
-# ---------------------------------------------------------------------------
-# LLM calls
-# ---------------------------------------------------------------------------
-
-def _format_results(results: list[dict], start: int = 1) -> str:
-    return "\n\n".join(
-        f"[{start + i}] {r.get('title', '')}\nSource: {r.get('url', '')}\n{r.get('content', '')}"
-        for i, r in enumerate(results)
-        if r.get("content")
-    )
-
-
-def _synthesize_sync(query: str, background: list[dict], recent: list[dict],
-                     detail_level: int) -> str:
-    """Synthétise les deux volets en une seule réponse orale.
-
-    Un seul appel LLM plutôt qu'un par volet : le modèle a besoin de voir le
-    fond pour savoir ce qui, dans l'actualité, mérite d'être signalé comme
-    nouveau.
-    """
-    system_prompt = DETAIL_SYSTEM_PROMPTS.get(detail_level, DETAIL_SYSTEM_PROMPTS[2])
-
-    bg_text = _format_results(background[:10])
-    rc_text = _format_results(recent[:8], start=len(background[:10]) + 1)
-
-    # detail_level 1 attend une phrase unique : la structurer en deux temps
-    # produirait exactement ce que ce niveau cherche à éviter.
-    if bg_text and rc_text and detail_level > 1:
-        system_prompt += STRUCTURE_HINT
-
-    sections = []
-    if bg_text:
-        sections.append(f"FOND (encyclopédie et sources de référence):\n{bg_text}")
-    if rc_text:
-        sections.append(f"ACTUALITÉ RÉCENTE (presse):\n{rc_text}")
-    results_text = "\n\n".join(sections)
-
-    user_content = f"Question: {query}\n\nRésultats de recherche:\n{results_text}"
-
-    try:
-        client = openai.OpenAI(api_key=LLAMACPP_API_KEY, base_url=LLM_BASE_URL)
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            tools=REPORT_TOOL,
-            tool_choice="required",
-            max_tokens=MAX_TOKENS_BY_LEVEL.get(detail_level, 250),
-        )
-        msg = resp.choices[0].message
-        report = ""
-
-        if msg.tool_calls:
-            try:
-                report = json.loads(msg.tool_calls[0].function.arguments).get("report", "")
-            except (json.JSONDecodeError, AttributeError, IndexError) as e:
-                logger.warning(f"Tool call illisible: {e}")
-
-        if not report and msg.content:
-            # vLLM annonce finish_reason=tool_calls mais ne parse aucun tool call
-            # avec ce modèle : la synthèse arrive telle quelle dans content. Sans
-            # cette reprise, on la jetait pour renvoyer results_text[:500], soit un
-            # extrait brut tronqué après plusieurs secondes d'attente.
-            content = msg.content.strip()
-            if content.startswith("{"):
-                try:
-                    content = json.loads(content).get("report", content)
-                except json.JSONDecodeError:
-                    pass
-            report = content
-
-        logger.info(f"Synthèse (level={detail_level}): {report[:100]!r}...")
-        return report or results_text[:500]
-    except Exception as e:
-        logger.error(f"Synthèse échouée: {e}")
-        return results_text[:500]
-
 
 # ---------------------------------------------------------------------------
 # Filtrage des résultats
@@ -331,6 +187,22 @@ def _dedup_results(results: list[dict]) -> list[dict]:
             seen.add(url)
             out.append(r)
     return out
+
+
+def _format_results(results: list[dict], start: int = 1) -> str:
+    """Met les résultats en forme pour l'appelant, tronqués par source.
+
+    La troncature n'est pas cosmétique, elle décide du temps de réponse de
+    l'assistant : mesuré sur un tour de parole complet, 9 000 caractères lui
+    coûtent 3,1s contre 9,0s pour 36 000. Au-delà, il paie le prefill sans rien
+    y gagner — les premières lignes d'un article portent l'essentiel.
+    """
+    return "\n\n".join(
+        f"[{start + i}] {r.get('title', '')}\nSource: {r.get('url', '')}\n"
+        f"{(r.get('content') or '')[:RESULT_MAX_CHARS]}"
+        for i, r in enumerate(results)
+        if r.get("content")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +389,69 @@ async def _noop_list() -> list[dict]:
     return []
 
 
+def _fit_to_budget(text: str, budget: int) -> str:
+    """Coupe à la fin du dernier résultat qui tient dans le budget.
+
+    Couper au milieu d'une source donnerait une phrase tronquée que le LLM
+    lecteur prendrait pour un fait complet ; mieux vaut rendre une source de
+    moins et que chacune soit entière.
+    """
+    if len(text) <= budget:
+        return text
+    blocs = text.split("\n\n")
+    gardes, taille = [], 0
+    for bloc in blocs:
+        if taille + len(bloc) + 2 > budget:
+            break
+        gardes.append(bloc)
+        taille += len(bloc) + 2
+    # Aucun bloc entier ne tient : on rend le premier tronqué plutôt que rien.
+    return "\n\n".join(gardes) if gardes else blocs[0][:budget]
+
+
+def _build_response(background: list[dict], recent: list[dict],
+                    max_chars: int | None = None) -> dict:
+    """Assemble la réponse rendue à l'appelant.
+
+    L'agent ne rédige pas : il rend la matière, l'appelant formule. Mesuré sur
+    un tour de parole complet, faire synthétiser l'agent coûtait 11,1s pour un
+    résultat moins précis que 3,1s en rendant le brut — la double reformulation
+    perdait les dates et les chiffres au passage.
+
+    max_chars laisse l'appelant fixer son budget de contexte. L'agent le
+    répartit lui-même à parts égales entre les deux volets et coupe sur une
+    frontière de source : un appelant qui tronquerait la réponse concaténée
+    perdrait l'actualité, qui vient en second.
+
+    Les deux volets sont ordonnés par pertinence décroissante — Wikipédia
+    d'abord pour le fond —, donc ce qui saute en cas de budget serré est
+    toujours le moins pertinent.
+    """
+    bg = _format_results(background[:BACKGROUND_N])
+    rc = _format_results(recent[:RECENT_N], start=len(background[:BACKGROUND_N]) + 1)
+
+    if max_chars:
+        # Moitié pour chacun, puis on repasse au second ce que le premier n'a
+        # pas consommé : couper sur une frontière de source laisse souvent un
+        # reliquat, autant qu'il serve.
+        moitie = max(max_chars // 2, 200)
+        bg = _fit_to_budget(bg, moitie)
+        rc = _fit_to_budget(rc, max(max_chars - len(bg), 200))
+
+    report = "\n\n---\n\n".join(
+        s for s in (f"FOND\n{bg}" if bg else "", f"ACTUALITÉ RÉCENTE\n{rc}" if rc else "") if s
+    )
+    return {
+        "report": report,
+        "background": bg,
+        "recent": rc,
+        "sources": [
+            {"title": r.get("title", ""), "url": r.get("url", "")}
+            for r in (background[:3] + recent[:3])
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # MQTT
 # ---------------------------------------------------------------------------
@@ -561,24 +496,24 @@ async def on_user_connected(topic: str, payload):
                         "(sujet, personne, lieu, définition, valeur boursière, événement). "
                         "Poser la question telle quelle : la recherche interroge à la fois "
                         "l'encyclopédie et le web pour le fond du sujet, et la presse pour "
-                        "ce qui a bougé récemment, puis rend une réponse qui enchaîne les "
-                        "deux. Rien d'autre à préciser."
+                        "ce qui a bougé récemment. Rien d'autre à préciser."
                     ),
                     "access": "write",
                     "response_topic": result_topic,
                     "format": {
                         "query": "string",
                         "n_results": 8,
-                        "detail_level": 2,
+                        "max_chars": 0,
                     },
                 },
                 {
                     "topic": result_topic,
                     "description": (
-                        "Résultat de la recherche internet. Utiliser le champ 'report' pour "
-                        "répondre : il couvre déjà le fond du sujet puis l'actualité récente. "
-                        "'background' et 'recent' donnent les sources brutes de chaque volet, "
-                        "pour les agents qui veulent les traiter séparément."
+                        "Extraits des sources trouvées, à reformuler pour répondre. Le champ "
+                        "'report' contient les deux volets à la suite : FOND (encyclopédie et "
+                        "sources de référence) puis ACTUALITÉ RÉCENTE (presse). 'background' et "
+                        "'recent' donnent chaque volet séparément. Ce sont des extraits bruts, "
+                        "pas une réponse rédigée : les reformuler, ne jamais les lire tels quels."
                     ),
                     "access": "read",
                     "format": {
@@ -621,14 +556,9 @@ async def on_user_connected(topic: str, payload):
 
         try:
             n_results = int(p.get("n_results", DEFAULT_N_RESULTS))
-            detail_level = int(p.get("detail_level", 2))
-            if detail_level not in (1, 2, 3):
-                detail_level = 2
-            logger.info(f"[{username}] Recherche: '{query}' n={n_results} level={detail_level}")
+            max_chars = int(p.get("max_chars", 0)) or None
+            logger.info(f"[{username}] Recherche: '{query}' n={n_results} max_chars={max_chars}")
 
-            loop = asyncio.get_event_loop()
-
-            # 1. Fond (wikipédia + web) et actualité (presse), en parallèle
             background, recent_res = await _search_two_sided(
                 query, n_results, log_prefix=f"[{username}/{session_id}]"
             )
@@ -640,21 +570,7 @@ async def on_user_connected(topic: str, payload):
                 })
                 return
 
-            # 2. Synthèse des deux volets en une seule réponse orale
-            report = await loop.run_in_executor(
-                None, _synthesize_sync, query, background, recent_res, detail_level
-            )
-
-            sources = [
-                {"title": r.get("title", ""), "url": r.get("url", "")}
-                for r in (background[:3] + recent_res[:3])
-            ]
-            await nexus.publish(result_topic, {
-                "report": report,
-                "background": _format_results(background[:10]),
-                "recent": _format_results(recent_res[:8]),
-                "sources": sources,
-            })
+            await nexus.publish(result_topic, _build_response(background, recent_res, max_chars))
             logger.info(f"[{username}/{session_id}] Résultat publié sur {result_topic}")
         except Exception as e:
             logger.exception(f"[{username}/{session_id}] Erreur inattendue lors du traitement de la requête search: {e}")
@@ -695,35 +611,17 @@ async def main():
             return
         try:
             n_results    = int(payload.get("n_results", DEFAULT_N_RESULTS))
-            logger.info(f"[service] Recherche: {query!r}")
+            max_chars    = int(payload.get("max_chars", 0)) or None
+            logger.info(f"[service] Recherche: {query!r} max_chars={max_chars}")
 
             background, recent_res = await _search_two_sided(query, n_results, log_prefix="[service]")
             if not background and not recent_res:
                 await nexus.publish(reply_to, {"report": "", "sources": []})
                 return
 
-            # Pas de synthèse LLM ici : les agents appelants (bulletin news)
-            # refont leur propre passe sur le contenu brut, une synthèse
-            # intermédiaire ne ferait que leur retirer de la matière.
-            bg = _format_results(background[:10])
-            rc = _format_results(recent_res[:8], start=len(background[:10]) + 1)
-            report = "\n\n---\n\n".join(
-                s for s in (
-                    f"FOND\n{bg}" if bg else "",
-                    f"ACTUALITÉ RÉCENTE\n{rc}" if rc else "",
-                ) if s
-            )
-            sources = [
-                {"title": r.get("title", ""), "url": r.get("url", "")}
-                for r in (background[:3] + recent_res[:3])
-            ]
-            await nexus.publish(reply_to, {
-                "report": report,
-                "background": bg,
-                "recent": rc,
-                "sources": sources,
-            })
-            logger.info(f"[service] Résultat publié ({len(report)} chars)")
+            response = _build_response(background, recent_res, max_chars)
+            await nexus.publish(reply_to, response)
+            logger.info(f"[service] Résultat publié ({len(response['report'])} chars)")
         except Exception as e:
             logger.error(f"[service] Erreur recherche {query!r}: {e}")
             await nexus.publish(reply_to, {"report": "", "sources": [], "error": f"internal search error: {e}"})
