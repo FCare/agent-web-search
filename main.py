@@ -60,7 +60,11 @@ DDGS_REGION = os.environ.get("DDGS_REGION", "fr-fr")
 # gratuite, sans clé, et répond en 0,6 s.
 WIKIPEDIA_API = os.environ.get("WIKIPEDIA_API", "https://fr.wikipedia.org/w/api.php")
 WIKIPEDIA_N = int(os.environ.get("WIKIPEDIA_N", "3"))
-WIKIPEDIA_UA = "caronboulme-search-agent/1.0 (https://caronboulme.fr)"
+
+# UA descriptif du service, envoyé sur tout appel HTTP sortant (fetch de page
+# comme API Wikipédia) — identifie l'agent au lieu de se faire passer pour un
+# autre projet (ex: SearXNG, qu'on n'utilise plus).
+SERVICE_UA = "caronboulme-search-agent/1.0 (https://caronboulme.fr)"
 
 AGENT_NAME = "search"
 _subscribed_sessions: set[str] = set()
@@ -122,7 +126,7 @@ def _is_reference_noise(url: str) -> bool:
 
 
 _FETCH_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; SearXNG/1.0; +https://searxng.org)",
+    "User-Agent": SERVICE_UA,
     "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "fr,en;q=0.9",
 }
@@ -277,7 +281,7 @@ async def _wikipedia_search(query: str, n: int = WIKIPEDIA_N) -> list[dict]:
     par un fetch de page.
     """
     try:
-        async with aiohttp.ClientSession(headers={"User-Agent": WIKIPEDIA_UA}) as session:
+        async with aiohttp.ClientSession(headers={"User-Agent": SERVICE_UA}) as session:
             async with session.get(
                 WIKIPEDIA_API,
                 params={
