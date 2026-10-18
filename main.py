@@ -504,6 +504,7 @@ async def on_user_connected(topic: str, payload):
                     ),
                     "access": "write",
                     "response_topic": result_topic,
+                    "slow": True,  # réponse en plusieurs secondes : phrase d'attente
                     "format": {
                         "query": "string",
                         "n_results": 8,
