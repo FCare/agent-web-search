@@ -43,6 +43,26 @@ BACKGROUND_N = int(os.environ.get("BACKGROUND_N", "6"))
 RECENT_N = int(os.environ.get("RECENT_N", "5"))
 ANYSEARCH_API_KEY = os.environ.get("ANYSEARCH_API_KEY", "")
 ANYSEARCH_URL = "https://api.anysearch.com/v1/search"
+# Juge LLM (thebrain) : décide si les résultats ddgs suffisent avant AnySearch.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://thebrain:8000/v1")
+LLM_MODEL = os.environ.get("LLM_MODEL", "google/gemma-4-12B-it-qat-w4a16-ct")
+LLAMACPP_API_KEY = os.environ.get("LLAMACPP_API_KEY", "")
+JUDGE_EXCERPT_CHARS = int(os.environ.get("JUDGE_EXCERPT_CHARS", "800"))
+JUDGE_TIMEOUT = float(os.environ.get("JUDGE_TIMEOUT", "10"))
+
+JUDGE_SYSTEM_PROMPT = (
+    "Tu juges si des résultats de recherche web suffisent pour répondre "
+    "correctement à une requête. Tu reçois la requête puis des extraits de "
+    "pages. Il ne suffit pas que les extraits touchent le sujet : tu dois "
+    "pouvoir te fier à la qualité de la réponse qu'ils permettent (contenu "
+    "précis, concret, de sources crédibles) et à sa diversité (plusieurs "
+    "sources distinctes qui apportent des éléments différents ou qui se "
+    "recoupent, pas une seule source ni des pages quasi identiques). Réponds "
+    "uniquement par un objet JSON {\"suffisant\": true} si tu es confiant sur "
+    "la qualité et la diversité, ou {\"suffisant\": false} si les extraits "
+    "sont absents, hors sujet, pauvres, redondants ou reposent sur une seule "
+    "source."
+)
 
 # Backends ddgs interrogés dans l'ordre, le premier qui répond gagne. Mesuré le
 # 28/07/2026 depuis cette IP : en text bing/yandex/yahoo répondent, brave,
@@ -354,6 +374,46 @@ async def _anysearch_search(query: str, n: int) -> list[dict]:
         return []
 
 
+async def _ddgs_is_sufficient(query: str, results: list[dict]) -> bool:
+    """Demande au LLM si les résultats ddgs répondent à la requête.
+
+    Sans résultat, inutile d'appeler le LLM. Si le juge est injoignable ou
+    répond de travers, on retombe sur « suffisant s'il y a au moins un résultat ».
+    """
+    if not results:
+        return False
+    extraits = "\n\n".join(
+        f"[{r.get('title', '')}] {(r.get('content') or '')[:JUDGE_EXCERPT_CHARS]}"
+        for r in results
+    )
+    headers = {"Authorization": f"Bearer {LLAMACPP_API_KEY}"} if LLAMACPP_API_KEY else {}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{LLM_BASE_URL}/chat/completions",
+                headers=headers,
+                json={
+                    "model": LLM_MODEL,
+                    "messages": [
+                        {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                        {"role": "user", "content": f"Requête : {query}\n\nExtraits :\n{extraits}"},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 20,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=aiohttp.ClientTimeout(total=JUDGE_TIMEOUT),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        verdict = bool(json.loads(data["choices"][0]["message"]["content"])["suffisant"])
+        logger.info(f"Juge ddgs '{query[:50]}': suffisant={verdict}")
+        return verdict
+    except Exception as e:
+        logger.warning(f"Juge ddgs indisponible ({type(e).__name__}: {e}) — repli sur présence de résultats")
+        return True
+
+
 async def _search_two_sided(query: str, n: int, log_prefix: str = "") -> tuple[list[dict], list[dict]]:
     """Cherche le fond et l'actualité en parallèle, renvoie (fond, récent).
 
@@ -361,9 +421,10 @@ async def _search_two_sided(query: str, n: int, log_prefix: str = "") -> tuple[l
     presse pour l'actualité. Le coût en latence est celui de la plus lente,
     pas de leur somme.
 
-    AnySearch ne prend le relais que si le web ET la presse sont muets :
-    Wikipédia seul ne suffit pas à considérer la recherche réussie, il répond
-    presque toujours quelque chose, fût-ce à côté.
+    AnySearch complète le web quand un LLM juge les résultats ddgs (après
+    scraping, web + presse) insuffisants pour la requête. Wikipédia ne compte
+    pas dans le jugement : il répond presque toujours quelque chose, fût-ce à
+    côté.
     """
     wiki, web, press = await asyncio.gather(
         _wikipedia_search(query),
@@ -371,17 +432,20 @@ async def _search_two_sided(query: str, n: int, log_prefix: str = "") -> tuple[l
         _ddgs_search(query, n, recent=True),
     )
 
-    if not web and not press:
-        logger.info(f"{log_prefix} ddgs muet des deux côtés — fallback AnySearch")
-        web = await _anysearch_search(query, n)
-
-    background_raw = _dedup_results(wiki + web)
-    recent_raw = _dedup_results(press)
-
-    background, recent_res = await asyncio.gather(
-        _enrich_results(background_raw) if background_raw else _noop_list(),
-        _enrich_results(recent_raw) if recent_raw else _noop_list(),
+    web_raw = _dedup_results(web)
+    press_raw = _dedup_results(press)
+    web_full, press_full = await asyncio.gather(
+        _enrich_results(web_raw) if web_raw else _noop_list(),
+        _enrich_results(press_raw) if press_raw else _noop_list(),
     )
+
+    if not await _ddgs_is_sufficient(query, web_full + press_full):
+        logger.info(f"{log_prefix} ddgs jugé insuffisant — complément AnySearch")
+        extra = _dedup_results(await _anysearch_search(query, n))
+        web_full = web_full + (await _enrich_results(extra) if extra else [])
+
+    background = _dedup_results(wiki + web_full)
+    recent_res = press_full
     logger.info(
         f"{log_prefix} fond: {len(background)} sources "
         f"({len(wiki)} wikipédia) — actualité: {len(recent_res)} sources"

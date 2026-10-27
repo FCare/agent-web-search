@@ -20,6 +20,9 @@ services:
       DDGS_TEXT_BACKENDS: ${DDGS_TEXT_BACKENDS:-bing,yandex,yahoo}
       DDGS_NEWS_BACKENDS: ${DDGS_NEWS_BACKENDS:-bing,duckduckgo}
       DDGS_REGION: ${DDGS_REGION:-fr-fr}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://thebrain:8000/v1}
+      LLM_MODEL: ${LLM_MODEL:-google/gemma-4-12B-it-qat-w4a16-ct}
+      LLAMACPP_API_KEY: ${LLAMACPP_API_KEY:-}
     networks:
       - ansible
     restart: unless-stopped
